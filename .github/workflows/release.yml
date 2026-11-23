@@ -1,0 +1,35 @@
+# Builds stonks.flatpak and attaches it to the tag's GitHub release.
+# Runs when a v* tag is pushed, or by hand for a tag that already exists:
+#   gh workflow run release.yml -f tag=v0.1.0
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach the bundle to
+        required: true
+permissions:
+  contents: write
+jobs:
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51   # keep in step with runtime-version in the manifest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: io.github.igneous.Stonks.yml
+          bundle: stonks.flatpak
+          build-dir: build/flatpak          # under build/, which the manifest leaves out of the source
+          repo-dir: build/flatpak-repo
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: stonks.flatpak
+          fail_on_unmatched_files: true
