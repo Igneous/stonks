@@ -730,6 +730,7 @@ public class Window : Adw.ApplicationWindow {
         var row = new Adw.ExpanderRow () { use_markup = false, title = loose ? "Ungrouped" : g.name, expanded = true };
         row.add_prefix (new Gtk.Image.from_icon_name ("folder-symbolic"));
         folder_rows[g.id] = row;
+        if (!loose && g.parent != p.root) row.margin_start = 14;   // set in from the folder it is in
         int count = 0;
         for (int i = 0; !loose && i < g.children.length; i++) {
             int inner;
