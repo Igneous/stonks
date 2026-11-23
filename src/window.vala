@@ -13,6 +13,10 @@ const string[] FACTS = { "Open", "High", "Low", "Prev close", "Volume", "Avg vol
 // "-7.02 today": what the change is over, for each range.
 const string[] SPANS = { "today", "past 7 days", "past 30 days", "year to date", "past year", "past 5 years", "all time" };
 
+// A folder's settings, as the user reads them: in the order of Arrange and of Dock.
+const string[] ARRANGEMENTS = { "By value", "Horizontal strip", "Vertical strip", "Autogrid", "Fibonacci" };
+const string[] DOCKS = { "In line", "Pinned to the top", "Pinned to the bottom", "Pinned to the left", "Pinned to the right" };
+
 // GTK's own call for a display-wide stylesheet. Bound here because Vala files it under Gtk.StyleContext,
 // a class deprecated as a whole although this function is not.
 [CCode (cname = "gtk_style_context_add_provider_for_display")]
@@ -76,6 +80,8 @@ public class Window : Adw.ApplicationWindow {
     bool tile_charts = true;   // the heatmap's background charts; saved with the portfolio
     Gtk.ListBox folders = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" } };
     string folders_shown = "";   // what the sidebar was last built from, see show_folders()
+    HashTable<string, unowned Gtk.Widget> folder_rows = new HashTable<string, unowned Gtk.Widget> (str_hash, str_equal);   // by folder id
+    bool upgrading;              // the saved file is from before folders had layouts, see adopt_top_row()
 
     public Window (Adw.Application app) {
         Object (application: app, title: "Stonks", default_width: 1240, default_height: 820);
@@ -88,6 +94,7 @@ public class Window : Adw.ApplicationWindow {
                 if (q != null) p.quotes[symbol] = q;
             }
         }
+        if (upgrading) adopt_top_row ();
 
         // The styling of our own: the coloured pill a change sits in, and the sidebar row that is open.
         var css = new Gtk.CssProvider ();
@@ -98,6 +105,9 @@ public class Window : Adw.ApplicationWindow {
         var header = new Adw.HeaderBar () { title_widget = new Adw.ViewSwitcher () { stack = pages, policy = Adw.ViewSwitcherPolicy.WIDE } };
         header.pack_start (new Gtk.Button.from_icon_name ("list-add-symbolic") { action_name = "win.add", tooltip_text = "Add stock (Ctrl+N)" });
         var menu = new Menu ();
+        var layouts = new Menu ();
+        for (int i = 0; i < ARRANGEMENTS.length; i++) layouts.append_item (menu_item (ARRANGEMENTS[i], "win.arrange", new Variant.int32 (i)));
+        menu.append_submenu ("Heatmap Layout", layouts);   // the heatmap is the outermost folder; the others have gears
         menu.append ("Charts in Heatmap Tiles", "win.tile-charts");
         menu.append ("Reload Logos", "win.reload-logos");
         header.pack_end (new Gtk.MenuButton () { icon_name = "open-menu-symbolic", tooltip_text = "Main menu", primary = true, menu_model = menu });
@@ -185,13 +195,14 @@ public class Window : Adw.ApplicationWindow {
         // its folders, searchable; the header's toggle shows and hides it.
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         treemap.charts = tile_charts;
-        treemap.dropped.connect ((payload, folder, target, after) => dropped (payload, folder, target, after));
+        treemap.changed.connect (rearranged);
+        treemap.configure.connect ((folder, gear) => layout_popover (folder, treemap, gear));
         treemap.peeked.connect ((symbol) => { treemap.card.child = hover_card (symbol); });
         treemap.opened.connect ((symbol) => show_stock (symbol));   // double-clicked
         var side = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         side.append (new Gtk.CenterBox () {
             start_widget = new Gtk.Label ("Folders") { css_classes = { "heading" } },
-            end_widget = new Gtk.Button.from_icon_name ("folder-new-symbolic") { action_name = "win.new-folder", tooltip_text = "New folder", css_classes = { "flat" } }
+            end_widget = new Gtk.Button.from_icon_name ("folder-new-symbolic") { action_name = "win.new-folder", action_target = new Variant.string (""), tooltip_text = "New folder", css_classes = { "flat" } }
         });
         var search = new Gtk.SearchEntry () { placeholder_text = "Find a stock" };
         search.search_changed.connect (() => {
@@ -199,7 +210,7 @@ public class Window : Adw.ApplicationWindow {
             show_folders ();
         });
         side.append (search);
-        side.append (new Gtk.Label ("Click to open. Drag to arrange, here or on the heatmap: onto a folder to file a stock, onto another stock to put it beside that one.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
+        side.append (new Gtk.Label ("Click to open. Drag to arrange, here or on the heatmap: a stock onto a folder or beside another stock; a folder into another, or beside it by its edge.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
         side.append (folders);
         // A plain list doesn't pass a click on to its rows; the folders' own lists do.
         folders.row_activated.connect ((row) => { if (row is Adw.ActionRow) ((Adw.ActionRow) row).activate (); });
@@ -262,22 +273,35 @@ public class Window : Adw.ApplicationWindow {
         });
         add_action (reload_logos);
 
-        // Folder actions; the sidebar's menus carry the folder or stock they act on as the target.
-        var new_folder = new SimpleAction ("new-folder", null);
-        new_folder.activate.connect (() => folder_dialog (""));
+        var arrange = new SimpleAction.stateful ("arrange", VariantType.INT32, new Variant.int32 (p.root.arrange));
+        arrange.activate.connect ((to) => {
+            p.root.arrange = (Arrange) to.get_int32 ();
+            arrange.set_state (to);
+            rearranged ();
+        });
+        add_action (arrange);
+
+        // Folder actions; the sidebar's menus carry the id of the folder (or the stock) they act on as the target.
+        var new_folder = new SimpleAction ("new-folder", VariantType.STRING);   // inside that one; "" for the top level
+        new_folder.activate.connect ((id) => folder_dialog (null, p.folder (id.get_string ())));
         add_action (new_folder);
         var rename_folder = new SimpleAction ("rename-folder", VariantType.STRING);
-        rename_folder.activate.connect ((name) => folder_dialog (name.get_string ()));
+        rename_folder.activate.connect ((id) => folder_dialog (p.folder (id.get_string ()), p.root));
         add_action (rename_folder);
         var delete_folder = new SimpleAction ("delete-folder", VariantType.STRING);
-        delete_folder.activate.connect ((name) => {
-            p.rename_group (name.get_string (), "");   // its stocks become ungrouped; nothing is removed
-            save ();
-            update ();
+        delete_folder.activate.connect ((id) => {
+            p.remove_group (p.folder (id.get_string ()));   // what was in it moves up a level; nothing is removed
+            rearranged ();
         });
         add_action (delete_folder);
+        var layout_folder = new SimpleAction ("layout-folder", VariantType.STRING);
+        layout_folder.activate.connect ((id) => {
+            var row = folder_rows[id.get_string ()];
+            if (row != null) layout_popover (p.folder (id.get_string ()), row, null);
+        });
+        add_action (layout_folder);
         var add_to = new SimpleAction ("add-to", VariantType.STRING);
-        add_to.activate.connect ((name) => add_dialog (new Lot () { group = name.get_string () }));
+        add_to.activate.connect ((id) => add_dialog (new Lot () { group = id.get_string () }));
         add_action (add_to);
         var remove = new SimpleAction ("remove", VariantType.STRING);
         remove.activate.connect ((symbol) => remove_symbol (symbol.get_string ()));
@@ -286,7 +310,8 @@ public class Window : Adw.ApplicationWindow {
         move.activate.connect ((target) => {
             string symbol, folder;
             target.get ("(ss)", out symbol, out folder);
-            file (symbol, folder);
+            p.assign (symbol, folder);
+            rearranged ();
         });
         add_action (move);
 
@@ -640,23 +665,8 @@ public class Window : Adw.ApplicationWindow {
 
     // ---- heatmap folders ----
 
-    // Put a stock in a folder ("" for none): from the Move menu or the add dialog.
-    void file (string symbol, string folder) {
-        p.assign (symbol, folder);
-        save ();
-        update ();
-    }
-
-    // Something was dragged and dropped, in the sidebar or on the heatmap. A symbol goes into `folder`,
-    // and beside `target` (before it, or after) if it was dropped on one. A payload of "folder:" and a
-    // name is a folder being moved to just before `folder`.
-    void dropped (string payload, string folder, string? target, bool after) {
-        if (payload.has_prefix ("folder:")) {
-            p.move_group (payload.substring (7), folder);
-        } else {
-            if (target != null) p.move (payload, target, after);
-            p.assign (payload, folder);
-        }
+    // The arrangement changed, here or on the heatmap.
+    void rearranged () {
         save ();
         update ();
     }
@@ -667,24 +677,33 @@ public class Window : Adw.ApplicationWindow {
         return item;
     }
 
-    // The sidebar, shared by every page: the portfolio; each folder with the stocks filed in it, then
-    // the unfiled; then whatever sits in the heatmap's top row. A click opens a stock's card, the search
-    // field narrows the list. Rebuilt only when the arrangement (or what is open, or sought) changes,
-    // so a price refresh doesn't fold up what is open.
+    // "Tech > AI": a folder's name with those of the folders it is in.
+    string path_of (Group g) {
+        var text = g.name;
+        for (unowned Group? up = g.parent; up != null && up != p.root; up = up.parent) text = up.name + " › " + text;
+        return text;
+    }
+
+    // The sidebar, shared by every page: the portfolio; each folder with the folders and stocks in it;
+    // then the stocks in none. A click opens a stock's card, the search field narrows the list. Rebuilt
+    // only when the arrangement (or what is open, or sought) changes, so a price refresh doesn't fold
+    // up what is open.
     void show_folders () {
         var tiles = p.tiles (range, now_s (), 1, 1);
+        var all = p.folders ();
         var shape = new StringBuilder (@"$shown\n$sought\n");
         bool held = false;
-        for (int i = 0; i < p.groups.length; i++) shape.append (p.groups[i] + "\n");
+        for (int i = 0; i < all.length; i++) shape.append ("%s\t%s\t%s\n".printf (all[i].id, all[i].name, all[i].parent.id));
         for (int i = 0; i < tiles.length; i++) {
             if (tiles[i].kind == TileKind.GROUP) continue;
             held |= tiles[i].value > 0;
-            shape.append ("%s\t%s\t%s\t%d\t%d\n".printf (tiles[i].symbol, tiles[i].group, tiles[i].name, tiles[i].kind, (int) logos.contains (tiles[i].symbol)));
+            shape.append ("%s\t%s\t%s\t%d\n".printf (tiles[i].symbol, tiles[i].folder.id, tiles[i].name, (int) logos.contains (tiles[i].symbol)));
         }
         shape.append (held ? "held" : "");
         if (shape.str == folders_shown) return;
         folders_shown = shape.str;
         folders.remove_all ();
+        folder_rows.remove_all ();
 
         if (held && sought == "") {
             var portfolio = new Adw.ActionRow () { title = "Portfolio", subtitle = "Totals and positions", activatable = true };
@@ -693,70 +712,85 @@ public class Window : Adw.ApplicationWindow {
             if (shown == "") portfolio.add_css_class ("picked");
             folders.append (portfolio);
         }
-
-        string[] names = {};
-        for (int i = 0; i < p.groups.length; i++) names += p.groups[i];
-        names += "";   // the unfiled, last
-        foreach (var name in names) {
-            var folder = new Adw.ExpanderRow () { use_markup = false, title = name != "" ? name : "Ungrouped", expanded = true };
-            folder.add_prefix (new Gtk.Image.from_icon_name ("folder-symbolic"));
-            // Drop a stock on the folder to file it here (its rows take drops themselves, to place it
-            // among them); drop another folder on it to move that one to just before this.
-            var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
-            drop.drop.connect ((value, x, y) => {
-                var payload = value.get_string ();
-                if (!payload.has_prefix ("folder:") && p.is_benchmark (payload)) return false;   // the top row's stay there
-                // Later, not from inside the drop: it rebuilds this very list.
-                Idle.add (() => { dropped (payload, name, null, false); return Source.REMOVE; });
-                return true;
-            });
-            folder.add_controller (drop);
-            if (name != "") {
-                var grab = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
-                grab.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value ("folder:" + name));
-                folder.add_controller (grab);
-                folder.add_suffix (new Gtk.Button.from_icon_name ("list-add-symbolic") {
-                    tooltip_text = "Add a stock to this folder", valign = Gtk.Align.CENTER, css_classes = { "flat" },
-                    action_name = "win.add-to", action_target = new Variant.string (name)
-                });
-                var actions = new Menu ();
-                actions.append_item (menu_item ("Rename…", "win.rename-folder", new Variant.string (name)));
-                actions.append_item (menu_item ("Delete", "win.delete-folder", new Variant.string (name)));
-                folder.add_suffix (new Gtk.MenuButton () { icon_name = "view-more-symbolic", valign = Gtk.Align.CENTER, css_classes = { "flat" }, menu_model = actions });
-            }
-            int count = 0;
-            for (int i = 0; i < tiles.length; i++) {
-                var t = tiles[i];
-                if (t.kind != TileKind.STOCK || t.group != name || !(@"$(t.symbol) $(t.name)".down ().contains (sought))) continue;
-                folder.add_row (sidebar_row (t, name));
-                count++;
-            }
-            // Spelled out with ifs: valac 0.56 frees the inner result of a nested ?: over strings too early.
-            folder.subtitle = "Empty";
-            if (count == 1) folder.subtitle = "1 stock";
-            if (count > 1) folder.subtitle = @"$count stocks";
-            // Ungrouped stays listed while there are folders, so there is somewhere to drag a stock back
-            // out to. While searching, only folders with something found in them are.
-            if (sought != "" ? count > 0 : (name != "" || count > 0 || p.groups.length > 0)) folders.append (folder);
+        int found;
+        for (int i = 0; i < p.root.children.length; i++) {
+            var row = folder_row (p.root.children[i], tiles, out found);
+            if (sought == "" || found > 0) folders.append (row);   // while searching, only where something was found
         }
+        // The stocks in no folder. Listed even with none while there are folders, so there is somewhere
+        // to drag one back out to.
+        var loose = folder_row (p.root, tiles, out found);
+        if (sought != "" ? found > 0 : (found > 0 || all.length > 0)) folders.append (loose);
+    }
 
-        // The heatmap's top row: what is watched that isn't a company's stock.
-        var top = new Adw.ExpanderRow () { title = "Top row", subtitle = "Indices, funds and pairs you watch", expanded = true };
-        top.add_prefix (new Gtk.Image.from_icon_name ("starred-symbolic"));
-        int listed = 0;
+    // A folder's row in the sidebar, holding a row for each folder and each stock in it. `found` is how
+    // many stocks that comes to, however deep. The root's stands for the stocks in no folder.
+    Adw.ExpanderRow folder_row (Group g, GenericArray<Tile> tiles, out int found) {
+        bool loose = g == p.root;
+        var row = new Adw.ExpanderRow () { use_markup = false, title = loose ? "Ungrouped" : g.name, expanded = true };
+        row.add_prefix (new Gtk.Image.from_icon_name ("folder-symbolic"));
+        folder_rows[g.id] = row;
+        int count = 0;
+        for (int i = 0; !loose && i < g.children.length; i++) {
+            int inner;
+            var child = folder_row (g.children[i], tiles, out inner);
+            if (sought == "" || inner > 0) row.add_row (child);
+            count += inner;
+        }
         for (int i = 0; i < tiles.length; i++) {
             var t = tiles[i];
-            if (t.kind != TileKind.BENCHMARK || !(@"$(t.symbol) $(t.name)".down ().contains (sought))) continue;
-            top.add_row (sidebar_row (t, ""));
-            listed++;
+            if (t.kind == TileKind.GROUP || t.folder != g || !(@"$(t.symbol) $(t.name)".down ().contains (sought))) continue;
+            row.add_row (sidebar_row (t));
+            count++;
         }
-        if (listed > 0) folders.append (top);
+        found = count;
+        // Spelled out with ifs: valac 0.56 frees the inner result of a nested ?: over strings too early.
+        row.subtitle = "Empty";
+        if (count == 1) row.subtitle = "1 stock";
+        if (count > 1) row.subtitle = @"$count stocks";
+
+        // Drop a stock on the folder to file it here (its rows take drops themselves, to place it among
+        // them). Drop another folder on its heading: the middle puts it inside, the top edge before
+        // this one and the bottom edge after it.
+        var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
+        unowned Adw.ExpanderRow self = row;
+        drop.drop.connect ((value, x, y) => {
+            var payload = value.get_string ();
+            var box = self.get_first_child ();
+            double head = box != null && box.get_first_child () != null ? box.get_first_child ().get_height () : 50;
+            // Later, not from inside the drop: it rebuilds this very list.
+            Idle.add (() => {
+                var moving = p.folder (payload.has_prefix ("folder:") ? payload.substring (7) : "");
+                if (!payload.has_prefix ("folder:")) p.assign (payload, g.id);
+                else if (loose || y > head || (y > head * 0.25 && y < head * 0.75)) p.move_group (moving, g);
+                else p.move_group (moving, g.parent, g, y > head / 2);
+                rearranged ();
+                return Source.REMOVE;
+            });
+            return true;
+        });
+        row.add_controller (drop);
+        if (loose) return row;
+
+        var grab = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
+        grab.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value ("folder:" + g.id));
+        row.add_controller (grab);
+        row.add_suffix (new Gtk.Button.from_icon_name ("list-add-symbolic") {
+            tooltip_text = "Add a stock to this folder", valign = Gtk.Align.CENTER, css_classes = { "flat" },
+            action_name = "win.add-to", action_target = new Variant.string (g.id)
+        });
+        var actions = new Menu ();
+        actions.append_item (menu_item ("Layout…", "win.layout-folder", new Variant.string (g.id)));
+        actions.append_item (menu_item ("New Subfolder…", "win.new-folder", new Variant.string (g.id)));
+        actions.append_item (menu_item ("Rename…", "win.rename-folder", new Variant.string (g.id)));
+        actions.append_item (menu_item ("Delete", "win.delete-folder", new Variant.string (g.id)));
+        row.add_suffix (new Gtk.MenuButton () { icon_name = "view-more-symbolic", valign = Gtk.Align.CENTER, css_classes = { "flat" }, menu_model = actions });
+        return row;
     }
 
     // One row of the sidebar: a tracked symbol. Click it to open its card; drag it to arrange; its menu
-    // moves a stock between folders, or takes the symbol off the list.
-    Adw.ActionRow sidebar_row (Tile t, string folder) {
-        bool top = t.kind == TileKind.BENCHMARK;
+    // moves it between folders, or takes it off the list.
+    Adw.ActionRow sidebar_row (Tile t) {
         var row = new Adw.ActionRow () { use_markup = false, title = t.symbol, subtitle = t.name, subtitle_lines = 1, activatable = true };
         if (t.symbol == shown) row.add_css_class ("picked");
         if (logos.contains (t.symbol)) row.add_prefix (new Gtk.Image.from_paintable (logos[t.symbol]) { pixel_size = 24 });
@@ -769,24 +803,33 @@ public class Window : Adw.ApplicationWindow {
         drag.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value (t.symbol));
         drag.drag_begin.connect ((d) => { source.set_icon (new Gtk.WidgetPaintable (self), 0, 0); });
         row.add_controller (drag);
-        // Dropped on this row: beside it, above or below by which half was hit. Only its own kind: a
-        // stock among the stocks, a top-row entry within the top row.
+        // A stock dropped on this row goes beside it, above or below by which half was hit; a folder,
+        // into the folder this row is in.
         var beside = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
         beside.drop.connect ((value, x, y) => {
             var payload = value.get_string ();
             bool after = y > self.get_height () / 2;
-            bool fits = payload.has_prefix ("folder:") ? !top : p.is_benchmark (payload) == top;
-            if (payload == t.symbol || !fits) return false;
-            Idle.add (() => { dropped (payload, folder, t.symbol, after); return Source.REMOVE; });
+            if (payload == t.symbol) return false;
+            Idle.add (() => {
+                if (payload.has_prefix ("folder:")) {
+                    p.move_group (p.folder (payload.substring (7)), t.folder);
+                } else {
+                    p.move (payload, t.symbol, after);
+                    p.assign (payload, t.folder.id);
+                }
+                rearranged ();
+                return Source.REMOVE;
+            });
             return true;
         });
         row.add_controller (beside);
 
         var menu = new Menu ();
         var targets = new Menu ();
-        for (int k = 0; !top && k < p.groups.length; k++)
-            if (p.groups[k] != folder) targets.append_item (menu_item (p.groups[k], "win.move", new Variant ("(ss)", t.symbol, p.groups[k])));
-        if (!top && folder != "") targets.append_item (menu_item ("Ungrouped", "win.move", new Variant ("(ss)", t.symbol, "")));
+        var all = p.folders ();
+        for (int k = 0; k < all.length; k++)
+            if (all[k] != t.folder) targets.append_item (menu_item (path_of (all[k]), "win.move", new Variant ("(ss)", t.symbol, all[k].id)));
+        if (t.folder != p.root) targets.append_item (menu_item ("Ungrouped", "win.move", new Variant ("(ss)", t.symbol, "")));
         if (targets.get_n_items () > 0) menu.append_section ("Move to", targets);
         var last = new Menu ();
         last.append_item (menu_item ("Remove", "win.remove", new Variant.string (t.symbol)));
@@ -795,21 +838,80 @@ public class Window : Adw.ApplicationWindow {
         return row;
     }
 
-    // Name a new folder (old = "") or rename an existing one.
-    void folder_dialog (string old) {
-        var entry = new Gtk.Entry () { text = old, activates_default = true };
-        var dialog = new Adw.AlertDialog (old == "" ? "New folder" : "Rename folder", null) { extra_child = entry, default_response = "ok", close_response = "cancel" };
+    // Name a new folder inside `into`, or rename `old`.
+    void folder_dialog (Group? old, Group into) {
+        var entry = new Gtk.Entry () { text = old != null ? old.name : "", activates_default = true };
+        var title = "New folder";
+        if (old != null) title = "Rename folder";
+        else if (into != p.root) title = "New folder in " + into.name;
+        var dialog = new Adw.AlertDialog (title, null) { extra_child = entry, default_response = "ok", close_response = "cancel" };
         dialog.add_response ("cancel", "Cancel");
-        dialog.add_response ("ok", old == "" ? "Create" : "Rename");
+        dialog.add_response ("ok", old == null ? "Create" : "Rename");
         dialog.set_response_appearance ("ok", Adw.ResponseAppearance.SUGGESTED);
         dialog.response.connect ((id) => {
             var name = entry.text.strip ();
-            if (id != "ok" || name == "" || p.groups.find_with_equal_func (name, str_equal)) return;   // also covers "unchanged"
-            if (old == "") p.groups.add (name); else p.rename_group (old, name);
-            save ();
-            update ();
+            if (id != "ok" || name == "") return;
+            if (old != null) old.name = name; else p.add_group (name, into);
+            rearranged ();
         });
         dialog.present (this);
+    }
+
+    // A folder's layout settings, in a popover on `parent` (pointing at `at`, if given): from its gear
+    // on the heatmap, or its menu in the sidebar. They take effect as they are changed.
+    void layout_popover (Group g, Gtk.Widget parent, Gdk.Rectangle? at) {
+        var arrange = new Gtk.DropDown.from_strings (ARRANGEMENTS) { selected = g.arrange, hexpand = true };
+        var dock = new Gtk.DropDown.from_strings (DOCKS) { selected = g.dock };
+        var scroll = new Gtk.CheckButton.with_label ("Scroll rather than shrink the tiles") { active = g.scroll, tooltip_text = "For a strip with more in it than fits" };
+        var size = new Gtk.Button.with_label ("Reset size") { tooltip_text = "A pinned folder is resized by dragging its inner edge on the heatmap; this undoes that" };
+        scroll.sensitive = g.arrange == Arrange.ROW || g.arrange == Arrange.COLUMN;
+        size.sensitive = g.size > 0;
+        var form = new Gtk.Grid () { row_spacing = 8, column_spacing = 12, margin_top = 8, margin_bottom = 8, margin_start = 8, margin_end = 8 };
+        form.attach (new Gtk.Label (g.name) { xalign = 0, css_classes = { "heading" }, ellipsize = Pango.EllipsizeMode.END }, 0, 0, 2, 1);
+        form.attach (new Gtk.Label ("Arrangement") { xalign = 0 }, 0, 1);
+        form.attach (arrange, 1, 1);
+        form.attach (new Gtk.Label ("Position") { xalign = 0 }, 0, 2);
+        form.attach (dock, 1, 2);
+        form.attach (scroll, 0, 3, 2, 1);
+        form.attach (size, 0, 4, 2, 1);
+        arrange.notify["selected"].connect (() => {
+            g.arrange = (Arrange) arrange.selected;
+            scroll.sensitive = g.arrange == Arrange.ROW || g.arrange == Arrange.COLUMN;
+            rearranged ();
+        });
+        dock.notify["selected"].connect (() => {
+            p.dock_group (g, (Dock) dock.selected);
+            arrange.selected = g.arrange;   // a strip turns to run along the edge it is pinned to
+            size.sensitive = false;
+            rearranged ();
+        });
+        scroll.toggled.connect (() => { g.scroll = scroll.active; rearranged (); });
+        size.clicked.connect (() => { g.size = 0; size.sensitive = false; rearranged (); });
+
+        var popover = new Gtk.Popover () { child = form };
+        unowned Gtk.Popover self = popover;   // its parent holds it from here until it is closed
+        popover.set_parent (parent);
+        if (at != null) popover.pointing_to = at;
+        popover.closed.connect (() => { Idle.add (() => { self.unparent (); return Source.REMOVE; }); });
+        popover.popup ();
+    }
+
+    // Before folders had layouts, whatever was watched that wasn't a company's stock sat in a row along
+    // the top of the heatmap, by rule. That is a folder like any other now: make it, and file them in it.
+    void adopt_top_row () {
+        Group? top = null;
+        var tiles = p.tiles (range, now_s (), 1, 1);
+        for (int i = 0; i < tiles.length; i++) {
+            if (tiles[i].kind != TileKind.BENCHMARK) continue;
+            if (top == null) {
+                top = p.add_group ("Top row", p.root);
+                p.move_group (top, p.root, p.root.children[0]);   // first in the sidebar
+                top.arrange = Arrange.ROW;
+                p.dock_group (top, Dock.TOP);
+            }
+            p.assign (tiles[i].symbol, top.id);
+        }
+        save ();
     }
 
     // ---- quotes ----
@@ -910,12 +1012,17 @@ public class Window : Adw.ApplicationWindow {
         position.add (date);
         position.add (price);
         // Optional too: file it in a heatmap folder straight away. Row 0 is "None".
+        var all = p.folders ();
         var choices = new Gtk.StringList (null);
         choices.append ("None");
-        for (int i = 0; i < p.groups.length; i++) choices.append (p.groups[i]);
+        for (int i = 0; i < all.length; i++) choices.append (path_of (all[i]));
         var folder = new Adw.ComboRow () { title = "Folder", subtitle = "Where it sits on the heatmap", model = choices };
-        for (int i = 0; draft != null && i < p.groups.length; i++) if (p.groups[i] == draft.group) folder.selected = i + 1;
-        var filing = new Adw.PreferencesGroup () { visible = p.groups.length > 0 };
+        for (int i = 0; draft != null && i < all.length; i++) if (all[i].id == draft.group) folder.selected = i + 1;
+        // Until the user picks one, a folder is suggested (see autofill): "suggest" holds which, "chosen" that they did.
+        for (int i = all.length - 1; i >= 0; i--) if (all[i].arrange == Arrange.ROW || all[i].arrange == Arrange.COLUMN) folder.set_data<uint> ("suggest", i + 1);
+        folder.set_data<bool> ("chosen", folder.selected > 0);
+        folder.notify["selected"].connect (() => { if (!folder.get_data<bool> ("suggesting")) folder.set_data<bool> ("chosen", true); });
+        var filing = new Adw.PreferencesGroup () { visible = all.length > 0 };
         filing.add (folder);
         var form = new Gtk.Box (Gtk.Orientation.VERTICAL, 24) { margin_top = 12, margin_bottom = 24, margin_start = 24, margin_end = 24 };
         form.append (stock);
@@ -975,10 +1082,10 @@ public class Window : Adw.ApplicationWindow {
             picked = ((Adw.ActionRow) row).title;
             symbol.text = picked;
             shares.grab_focus ();
-            autofill (symbol, date, price);
+            autofill (symbol, shares, date, price, folder);
         });
-        shares.changed.connect (() => autofill (symbol, date, price));
-        date.changed.connect (() => autofill (symbol, date, price));
+        shares.changed.connect (() => autofill (symbol, shares, date, price, folder));
+        date.changed.connect (() => autofill (symbol, shares, date, price, folder));
 
         // Add stays disabled until the form parses; `lot` always holds the latest valid reading.
         // No shares means a stock to watch, so the rest of the position is switched off and ignored.
@@ -1007,7 +1114,7 @@ public class Window : Adw.ApplicationWindow {
         if (draft != null && draft.shares > 0) shares.text = "%.8g".printf (draft.shares);
         cancel.clicked.connect (() => { dialog.close (); });
         add.clicked.connect (() => {
-            lot.group = folder.selected > 0 ? p.groups[(int) folder.selected - 1] : "";
+            lot.group = folder.selected > 0 ? all[(int) folder.selected - 1].id : "";
             dialog.close ();
             add_lot.begin (lot);
         });
@@ -1040,13 +1147,21 @@ public class Window : Adw.ApplicationWindow {
         return p.quotes[symbol];
     }
 
-    // Put the close on the buy date into the price row, unless the user has typed a price of their own.
-    // The row remembers what was filled in ("auto") so a later date change can replace it.
-    void autofill (Adw.EntryRow symbol, Adw.EntryRow date, Adw.EntryRow price) {
+    // Fill in what the add dialog can work out once it knows the symbol's quote.
+    //  - The close on the buy date goes into the price row, unless the user has typed a price of their
+    //    own. The row remembers what was filled in ("auto") so a later date change can replace it.
+    //  - Something to watch that isn't a company's stock (an index, a fund, a pair) is offered the
+    //    first strip there is as its folder, until the user picks a folder themselves.
+    void autofill (Adw.EntryRow symbol, Adw.EntryRow shares, Adw.EntryRow date, Adw.EntryRow price, Adw.ComboRow folder) {
         var asked = symbol.text.strip ().up ();
         if (asked == "") return;
         peek.begin (asked, (obj, res) => {
             var q = peek.end (res);
+            if (q != null && symbol.text.strip ().up () == asked && !folder.get_data<bool> ("chosen")) {
+                folder.set_data<bool> ("suggesting", true);
+                folder.selected = !q.is_stock && shares.text.strip () == "" ? folder.get_data<uint> ("suggest") : 0;
+                folder.set_data<bool> ("suggesting", false);
+            }
             var day = new DateTime.from_iso8601 (date.text.strip () + "T00:00:00Z", null);
             // Read the form now, not when we asked: it may have moved on while the quote loaded.
             if (q == null || day == null || date.text.strip ().length != 10 || symbol.text.strip ().up () != asked) return;
@@ -1073,8 +1188,10 @@ public class Window : Adw.ApplicationWindow {
             if (other.symbol != lot.symbol) continue;
             if (chosen == "") lot.group = other.group;   // a symbol has one folder: without a new choice, the one it has
             if (lot.shares <= 0) {
-                if (chosen != "" && chosen != other.group) file (lot.symbol, chosen);
-                else toasts.add_toast (new Adw.Toast (@"$(lot.symbol) is already listed"));
+                if (chosen != "" && chosen != other.group) {
+                    p.assign (lot.symbol, chosen);
+                    rearranged ();
+                } else toasts.add_toast (new Adw.Toast (@"$(lot.symbol) is already listed"));
                 return;
             }
             if (other.shares <= 0) {
@@ -1142,13 +1259,23 @@ public class Window : Adw.ApplicationWindow {
             saved.get_array_member ("lots").foreach_element ((array, i, lot) => {
                 if (lot.get_node_type () == Json.NodeType.OBJECT) p.lots.append (Json.gobject_deserialize (typeof (Lot), lot));
             });
-            if (saved.has_member ("groups")) saved.get_array_member ("groups").foreach_element ((array, i, name) => {
-                if (name.get_node_type () == Json.NodeType.VALUE && name.get_string () != null) p.groups.add (name.get_string ());
-            });
-            // A folder some lot names but the list forgot (a hand-edited file) still exists.
-            for (uint i = 0; i < p.lots.get_n_items (); i++) {
-                var group = ((Lot) p.lots.get_item (i)).group;
-                if (group != "" && !p.groups.find_with_equal_func (group, str_equal)) p.groups.add (group);
+            if (saved.has_member ("heatmap")) {
+                read_folder (saved.get_object_member ("heatmap"), p.root);
+            } else {
+                // A file from before folders nested and had layouts: just their names, which serve as
+                // their ids from here on. Keep a copy of it as it was, the once.
+                upgrading = true;
+                if (!FileUtils.test (path + ".before-layouts", FileTest.EXISTS)) {
+                    try { FileUtils.set_contents (path + ".before-layouts", text); } catch (Error e) {}
+                }
+                if (saved.has_member ("groups")) saved.get_array_member ("groups").foreach_element ((array, i, name) => {
+                    if (name.get_node_type () == Json.NodeType.VALUE && name.get_string () != null) p.add_group (name.get_string (), p.root).id = name.get_string ();
+                });
+                // A folder some lot names but the list forgot (a hand-edited file) still exists.
+                for (uint i = 0; i < p.lots.get_n_items (); i++) {
+                    var group = ((Lot) p.lots.get_item (i)).group;
+                    if (group != "" && p.folder (group) == p.root) p.add_group (group, p.root).id = group;
+                }
             }
         } catch (Error e) {
             // Move it aside so the next save can't overwrite a file we failed to read.
@@ -1157,15 +1284,45 @@ public class Window : Adw.ApplicationWindow {
         }
     }
 
+    // A folder as saved, and those inside it.
+    Json.Object folder_json (Group g) {
+        var o = new Json.Object ();
+        if (g != p.root) {
+            o.set_string_member ("id", g.id);
+            o.set_string_member ("name", g.name);
+            o.set_int_member ("dock", g.dock);
+            o.set_double_member ("size", g.size);
+            o.set_boolean_member ("scroll", g.scroll);
+        }
+        o.set_int_member ("arrange", g.arrange);
+        var inner = new Json.Array ();
+        for (int i = 0; i < g.children.length; i++) inner.add_object_element (folder_json (g.children[i]));
+        o.set_array_member ("folders", inner);
+        return o;
+    }
+
+    void read_folder (Json.Object o, Group g) {
+        g.arrange = (Arrange) o.get_int_member_with_default ("arrange", 0).clamp (0, Arrange.FIBONACCI);
+        g.dock = (Dock) o.get_int_member_with_default ("dock", 0).clamp (0, Dock.RIGHT);
+        g.size = o.get_double_member_with_default ("size", 0).clamp (0, 0.8);
+        g.scroll = o.get_boolean_member_with_default ("scroll", false);
+        if (!o.has_member ("folders")) return;
+        o.get_array_member ("folders").foreach_element ((array, i, node) => {
+            if (node.get_node_type () != Json.NodeType.OBJECT) return;
+            var inner = node.get_object ();
+            var child = p.add_group (inner.get_string_member_with_default ("name", ""), g);
+            child.id = inner.get_string_member_with_default ("id", child.id);
+            read_folder (inner, child);
+        });
+    }
+
     void save () {
         var lots = new Json.Array ();
         for (uint i = 0; i < p.lots.get_n_items (); i++) lots.add_element (Json.gobject_serialize (p.lots.get_item (i)));
         var saved = new Json.Object ();
-        var groups = new Json.Array ();
-        for (int i = 0; i < p.groups.length; i++) groups.add_string_element (p.groups[i]);
         saved.set_string_member ("currency", p.currency);
         saved.set_boolean_member ("tile_charts", tile_charts);
-        saved.set_array_member ("groups", groups);
+        saved.set_object_member ("heatmap", folder_json (p.root));
         saved.set_array_member ("lots", lots);
         var node = new Json.Node (Json.NodeType.OBJECT);
         node.set_object (saved);

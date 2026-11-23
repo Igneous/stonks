@@ -210,28 +210,82 @@ public class Lot : Object {
     }
 }
 
+// How a folder lays out what is in it. Saved by number: add new ones at the end.
+public enum Arrange {
+    VALUE,       // a treemap: each tile as big as the holding is worth
+    ROW,         // a horizontal strip: side by side, every stock the same size
+    COLUMN,      // a vertical strip
+    GRID,        // equal cells, in as many rows and columns as keeps them nearest to square
+    FIBONACCI    // the first takes half, the next half of what is left, and so on round a spiral
+}
+
+// Where a folder sits in the one it is in: in line with the rest, or pinned along an edge. Saved by number.
+public enum Dock { FLOW, TOP, BOTTOM, LEFT, RIGHT }
+
+// A heatmap folder. They nest; the root, which has no name, is the heatmap itself.
+public class Group {
+    public string id = "";      // what a lot names it by; "" is the root
+    public string name = "";
+    public weak Group? parent;
+    public GenericArray<Group> children = new GenericArray<Group> ();
+    public Arrange arrange;
+    public Dock dock;
+    public double size;         // pinned: the share of its parent's height (or width) it takes; 0 leaves that to tiles()
+    public bool scroll;         // a strip: keep its tiles a readable size and scroll, rather than squeeze them all in
+    public double offset;       // how far it is scrolled and, set by tiles(), how far it can be. Neither is saved.
+    public double overflow;
+
+    // Whether this is `other` or somewhere inside it.
+    public bool within (Group other) {
+        for (unowned Group? g = this; g != null; g = g.parent) if (g == other) return true;
+        return false;
+    }
+}
+
 public enum TileKind {
-    STOCK,       // in the body of the treemap
-    BENCHMARK,   // an index, fund, currency pair or commodity that is only watched: the row along the top
-    GROUP        // a folder: the region its stocks are laid out in
+    STOCK,       // labelled by its ticker
+    BENCHMARK,   // an index, fund, pair or commodity that is only watched: labelled by its name and level
+    GROUP        // a folder: the frame its contents are laid out in
+}
+
+public struct Box {
+    public double x;
+    public double y;
+    public double w;
+    public double h;
 }
 
 // A treemap cell: one tracked symbol, or a folder of them.
 public class Tile {
     public TileKind kind;
-    public string symbol;   // a GROUP's is the folder name
+    public string symbol;   // a GROUP's is the folder's name
     public string name;
-    public string group = "";
+    public Group folder;    // the folder it is in; a GROUP's is the folder itself
     public string currency = "";
     public double price;    // the instrument's own
     public double shares;
     public double value;    // held, in the portfolio currency; 0 if only watched
-    public double weight;   // what sizes the tile: value, or a stand-in for watched symbols
+    public double weight;   // what sizes the tile by value: its value, or a stand-in for watched symbols
     public double change;   // the instrument's own price change over the range; a GROUP's is its stocks' average
+    public int count;       // a GROUP's stocks, however deep
     public double x;
     public double y;
     public double w;
     public double h;
+    public Box clip;        // the part of the heatmap it may show in: less than all of it inside a strip that scrolls
+
+    // A GROUP's room for what is in it: inside its frame, below its label.
+    public Box inside () {
+        double head = double.min (Portfolio.GROUP_HEADER, h / 3), edge = double.min (Portfolio.GROUP_BORDER, w / 8);
+        Box room = { x + edge, y + head, w - 2 * edge, h - head - edge };
+        return room;
+    }
+
+    // Whether a point is on the part of it that shows.
+    public bool covers (double px, double py) {
+        return px >= double.max (x, clip.x) && px < double.min (x + w, clip.x + clip.w)
+            && py >= double.max (y, clip.y) && py < double.min (y + h, clip.y + clip.h);
+    }
 }
 
 public class Portfolio {
@@ -241,12 +295,15 @@ public class Portfolio {
     // The held ones repriced into `currency`. Derived: call rebase() after quotes or currency change.
     public HashTable<string, Quote> converted = new HashTable<string, Quote> (str_hash, str_equal);
     public string currency = "USD";
-    // Heatmap folders, in the user's order. Kept here as well as on the lots so an empty one survives.
-    public GenericArray<string> groups = new GenericArray<string> ();
+    // The heatmap's folders: a tree, in the user's order. A lot names its folder by id; the root's is "".
+    public Group root = new Group ();
 
     public const double GROUP_HEADER = 22;    // pixels kept free at the top of a folder's region for its label
     public const double GROUP_BORDER = 3;     // ...and around its other three sides, so it reads as a frame
-    public const double BENCHMARK_ROW = 64;   // height of the row along the top
+    public const double STRIP_HEIGHT = 64;    // the tiles of a strip pinned along the top or bottom are this high,
+    public const double STRIP_WIDTH = 150;    // and down a side this wide, unless the user sized it
+    public const double SCROLL_WIDTH = 110;   // the least a strip that scrolls lets its tiles shrink to
+    public const double SCROLL_HEIGHT = 48;
 
     // Whether a symbol is on the list itself, as opposed to an FX pair we only convert totals through.
     public bool tracks (string symbol) {
@@ -254,19 +311,75 @@ public class Portfolio {
         return false;
     }
 
-    // Whether a symbol sits in the heatmap's top row rather than its body: something other than a
-    // company's stock (an index, a fund, a pair) that is watched and not held.
-    public bool is_benchmark (string symbol) {
-        var q = quotes[symbol];
-        if (q == null || q.is_stock) return false;
-        for (uint i = 0; i < lots.get_n_items (); i++) {
-            var l = (Lot) lots.get_item (i);
-            if (l.symbol == symbol && l.shares > 0) return false;
-        }
-        return true;
+    // Every folder but the root, each before the ones inside it, in the user's order.
+    public GenericArray<Group> folders () {
+        var all = new GenericArray<Group> ();
+        collect (root, all);
+        return all;
     }
 
-    // File a symbol (every lot of it) in a folder; "" takes it out.
+    static void collect (Group g, GenericArray<Group> into) {
+        for (int i = 0; i < g.children.length; i++) {
+            into.add (g.children[i]);
+            collect (g.children[i], into);
+        }
+    }
+
+    // The folder with an id; the root for "" or for one that no longer exists.
+    public Group folder (string id) {
+        var all = folders ();
+        for (int i = 0; i < all.length; i++) if (all[i].id == id) return all[i];
+        return root;
+    }
+
+    public Group add_group (string name, Group parent) {
+        var g = new Group () { id = Uuid.string_random (), name = name, parent = parent };
+        parent.children.add (g);
+        return g;
+    }
+
+    // Put a folder in another (or the root): next to `beside`, one of those already there, or at the end.
+    // Not into itself. It comes back in line; pinning it somewhere is dock_group()'s to do after.
+    public void move_group (Group g, Group into, Group? beside = null, bool after = false) {
+        if (g == root || into.within (g) || beside == g) return;
+        g.parent.children.remove (g);
+        uint at = 0;   // set apart from the test below: valac's flow analysis can't see through an `out` in a condition
+        bool found = beside != null && into.children.find (beside, out at);
+        if (!found) at = into.children.length;
+        else if (after) at++;
+        into.children.insert ((int) at, g);
+        g.parent = into;
+        g.dock = Dock.FLOW;
+        g.size = 0;
+    }
+
+    // Pin a folder along an edge of the one it is in, or (FLOW) put it back in line. A strip turns to
+    // run along the edge it is pinned to.
+    public void dock_group (Group g, Dock dock) {
+        bool side = dock == Dock.LEFT || dock == Dock.RIGHT;
+        if (g.arrange == Arrange.ROW && side) g.arrange = Arrange.COLUMN;
+        else if (g.arrange == Arrange.COLUMN && dock != Dock.FLOW && !side) g.arrange = Arrange.ROW;
+        g.dock = dock;
+        g.size = 0;
+    }
+
+    // Delete a folder. What was in it, folders and stocks, moves up into the one it was in.
+    public void remove_group (Group g) {
+        var up = g.parent;
+        uint at = 0;
+        if (up == null || !up.children.find (g, out at)) return;
+        for (uint i = 0; i < lots.get_n_items (); i++) {
+            var l = (Lot) lots.get_item (i);
+            if (l.group == g.id) l.group = up.id;
+        }
+        for (int i = 0; i < g.children.length; i++) {
+            g.children[i].parent = up;
+            up.children.insert ((int) at + 1 + i, g.children[i]);
+        }
+        up.children.remove_index (at);
+    }
+
+    // File a symbol (every lot of it) in a folder, by id; "" takes it out.
     public void assign (string symbol, string group) {
         for (uint i = 0; i < lots.get_n_items (); i++) {
             var l = (Lot) lots.get_item (i);
@@ -275,7 +388,7 @@ public class Portfolio {
     }
 
     // Move a symbol (every lot of it) to just before another, or just after. The order of the list is
-    // the order things appear in everywhere: the table, the top row, and within a folder on the heatmap.
+    // the order things appear in everywhere: the table, the sidebar, and within a folder on the heatmap.
     public void move (string symbol, string target, bool after) {
         if (symbol == target) return;
         Lot[] moved = {};
@@ -292,26 +405,6 @@ public class Portfolio {
             if (!after) break;           // before its first lot; after its last
         }
         for (int i = moved.length - 1; i >= 0; i--) lots.insert (at++, moved[i]);   // collected backwards
-    }
-
-    // Move a folder to just before another ("" for the end).
-    public void move_group (string name, string before) {
-        uint from = 0, to;
-        if (name == before || !groups.find_with_equal_func (name, str_equal, out from)) return;
-        groups.remove_index (from);
-        if (!groups.find_with_equal_func (before, str_equal, out to)) to = groups.length;
-        groups.insert ((int) to, name);
-    }
-
-    // Rename a folder, or with "" as the new name delete it and unfile its stocks.
-    public void rename_group (string old, string name) {
-        uint at;
-        if (!groups.find_with_equal_func (old, str_equal, out at)) return;
-        if (name == "") groups.remove_index (at); else groups[at] = name;
-        for (uint i = 0; i < lots.get_n_items (); i++) {
-            var l = (Lot) lots.get_item (i);
-            if (l.group == old) l.group = name;
-        }
     }
 
     static string? usd_pair (string cur) { return cur == "USD" ? null : cur + "USD=X"; }
@@ -420,16 +513,17 @@ public class Portfolio {
         return s;
     }
 
-    // The heatmap, laid out to fill w x h: one tile per tracked symbol, in the order of the list.
-    //  - Indices, funds, currency pairs and commodities that are only watched are context rather than
-    //    positions: they sit side by side in a row along the top.
-    //  - Everything else fills the rest, sized by value. A watched stock has no value, so it gets the
-    //    average holding's size (equal sizes if nothing is held).
-    //  - If any stock is filed in a folder, each folder becomes a region (a GROUP tile, listed just
-    //    before its stocks) in folder order, with unfiled stocks sharing a last one called "Ungrouped".
+    // The heatmap, laid out to fill w x h: one tile per tracked symbol, and one (a GROUP, listed just
+    // before what is in it) per folder that holds any. Each folder lays out its own contents: folders
+    // pinned to an edge first, then the folders in line, then its own stocks in the order of the list.
+    // Only Arrange.VALUE sizes by value; there a watched stock, which has none, gets the average
+    // holding's size (equal sizes if nothing is held).
     public GenericArray<Tile> tiles (Range r, int64 now, double w, double h) {
+        var homes = new HashTable<string, Group> (str_hash, str_equal);
+        var all = folders ();
+        for (int i = 0; i < all.length; i++) homes[all[i].id] = all[i];
         var by_symbol = new HashTable<string, Tile> (str_hash, str_equal);
-        var all = new GenericArray<Tile> ();
+        leaves = new GenericArray<Tile> ();
         for (uint i = 0; i < lots.get_n_items (); i++) {
             var l = (Lot) lots.get_item (i);
             var q = quotes[l.symbol];
@@ -437,68 +531,180 @@ public class Portfolio {
             var t = by_symbol[l.symbol];
             if (t == null) {
                 t = new Tile () { symbol = l.symbol, name = q.name, currency = q.currency, price = q.price, change = q.change (r, now) };
-                if (groups.find_with_equal_func (l.group, str_equal)) t.group = l.group;   // a folder that no longer exists is no folder
+                t.kind = q.is_stock ? TileKind.STOCK : TileKind.BENCHMARK;
+                t.folder = homes[l.group] ?? root;   // a folder that no longer exists is no folder
                 by_symbol[l.symbol] = t;
-                all.add (t);
+                leaves.add (t);
             }
             t.shares += l.shares;
+            if (l.shares > 0) t.kind = TileKind.STOCK;   // held: a position like any other
             var c = converted[l.symbol];
             if (c != null) t.value += l.shares * c.price;
         }
-
-        var result = new GenericArray<Tile> ();
-        var body = new GenericArray<Tile> ();
-        for (int i = 0; i < all.length; i++) {
-            all[i].kind = !quotes[all[i].symbol].is_stock && all[i].shares <= 0 ? TileKind.BENCHMARK : TileKind.STOCK;
-            if (all[i].kind == TileKind.BENCHMARK) result.add (all[i]); else body.add (all[i]);
-        }
-        double top = result.length > 0 ? double.min (BENCHMARK_ROW, h / 4) : 0;
-        for (int i = 0; i < result.length; i++) {
-            result[i].x = w * i / result.length;
-            result[i].w = w / result.length;
-            result[i].h = top;
-        }
-
         double total = 0;
         int held = 0;
-        bool grouped = false;
-        for (int i = 0; i < body.length; i++) {
-            grouped |= body[i].group != "";
-            if (body[i].value > 0) { total += body[i].value; held++; }
+        for (int i = 0; i < leaves.length; i++) if (leaves[i].value > 0) { total += leaves[i].value; held++; }
+        for (int i = 0; i < leaves.length; i++) leaves[i].weight = leaves[i].value > 0 ? leaves[i].value : (held > 0 ? total / held : 1);
+
+        laid = new GenericArray<Tile> ();
+        blocks = new HashTable<Group, Tile> (direct_hash, direct_equal);
+        if (summarize (root) != null) fill (root, { 0, 0, w, h }, { 0, 0, w, h });
+        return laid;
+    }
+
+    // What tiles() is working on, for the steps below.
+    GenericArray<Tile> leaves;
+    GenericArray<Tile> laid;
+    HashTable<Group, Tile> blocks;
+
+    // A folder's tile: the totals of everything in it, however deep. None for a folder with nothing
+    // in it, which gets no room on the heatmap.
+    Tile? summarize (Group g) {
+        var b = new Tile () { kind = TileKind.GROUP, symbol = g.name, name = "", folder = g };
+        for (int i = 0; i < leaves.length; i++) if (leaves[i].folder == g) add (b, leaves[i], 1);
+        for (int i = 0; i < g.children.length; i++) {
+            var inner = summarize (g.children[i]);
+            if (inner != null) add (b, inner, inner.count);
         }
-        for (int i = 0; i < body.length; i++) body[i].weight = body[i].value > 0 ? body[i].value : (held > 0 ? total / held : 1);
-        if (!grouped) {
-            layout (body, 0, body.length, 0, top, w, h - top);
-            for (int i = 0; i < body.length; i++) result.add (body[i]);
-            return result;
+        if (b.count == 0) return null;
+        b.change /= b.weight;
+        blocks[g] = b;
+        return b;
+    }
+
+    static void add (Tile sum, Tile t, int count) {
+        sum.value += t.value;
+        sum.weight += t.weight;
+        sum.change += t.weight * t.change;
+        sum.count += count;
+    }
+
+    // Lay out what is in a folder over `area`, of which `clip` is the part that shows.
+    void fill (Group g, Box area, Box clip) {
+        double x = area.x, y = area.y, w = area.w, h = area.h;
+        var items = new GenericArray<Tile> ();
+        var pinned = new GenericArray<Tile> ();
+        for (int i = 0; i < g.children.length; i++) {
+            var b = blocks[g.children[i]];
+            if (b == null) continue;
+            if (g.children[i].dock == Dock.FLOW) items.add (b); else pinned.add (b);
+        }
+        for (int i = 0; i < leaves.length; i++) if (leaves[i].folder == g) items.add (leaves[i]);
+
+        // The pinned folders, in order: each takes a slice off its edge of what is left. As thick as the
+        // user dragged it to; otherwise a strip along its edge is one tile thick, anything else gets
+        // room in proportion to what it holds, up to a third.
+        for (int i = 0; i < pinned.length; i++) {
+            var b = pinned[i];
+            var c = b.folder;
+            bool across = c.dock == Dock.TOP || c.dock == Dock.BOTTOM;
+            double room = across ? h : w, thick;
+            if (c.size > 0) thick = double.min (c.size * (across ? area.h : area.w), room * 0.8);
+            else if (c.arrange == (across ? Arrange.ROW : Arrange.COLUMN)) thick = double.min (across ? STRIP_HEIGHT + GROUP_HEADER + GROUP_BORDER : STRIP_WIDTH + 2 * GROUP_BORDER, room / 3);
+            else thick = double.min (room * b.weight / blocks[g].weight, room / 3);
+            if (items.length == 0 && i == pinned.length - 1) thick = room;   // nothing else to leave room for
+            b.x = c.dock == Dock.RIGHT ? x + w - thick : x;
+            b.y = c.dock == Dock.BOTTOM ? y + h - thick : y;
+            b.w = across ? w : thick;
+            b.h = across ? thick : h;
+            if (c.dock == Dock.TOP) y += thick;
+            if (c.dock == Dock.LEFT) x += thick;
+            if (across) h -= thick; else w -= thick;
+            enter (b, clip);
         }
 
-        string[] folders = {};
-        for (int i = 0; i < groups.length; i++) folders += groups[i];
-        folders += "";   // the unfiled, last
-        var regions = new GenericArray<Tile> ();
-        foreach (var folder in folders) {
-            var g = new Tile () { kind = TileKind.GROUP, symbol = folder != "" ? folder : "Ungrouped", name = "", group = folder };
-            for (int i = 0; i < body.length; i++) {
-                if (body[i].group != folder) continue;
-                g.value += body[i].value;
-                g.weight += body[i].weight;
-                g.change += body[i].weight * body[i].change;
+        g.overflow = 0;
+        switch (g.arrange) {
+        case Arrange.ROW:
+        case Arrange.COLUMN: strip (g, items, x, y, w, h); break;
+        case Arrange.GRID: grid (items, x, y, w, h); break;
+        case Arrange.FIBONACCI: spiral (items, x, y, w, h); break;
+        default: layout (items, 0, items.length, x, y, w, h); break;
+        }
+        // Nothing shows outside the folder's own room: that is what a scrolled strip is cut off by.
+        double left = double.max (clip.x, x), top = double.max (clip.y, y);
+        Box inside = { left, top, double.max (double.min (clip.x + clip.w, x + w) - left, 0), double.max (double.min (clip.y + clip.h, y + h) - top, 0) };
+        for (int i = 0; i < items.length; i++) {
+            if (items[i].kind == TileKind.GROUP) {
+                enter (items[i], inside);
+            } else {
+                items[i].clip = inside;
+                laid.add (items[i]);
             }
-            if (g.weight > 0) regions.add (g);   // an empty folder has no region
         }
-        layout (regions, 0, regions.length, 0, top, w, h - top);
-        for (int i = 0; i < regions.length; i++) {
-            var g = regions[i];
-            g.change /= g.weight;
-            result.add (g);
-            var members = new GenericArray<Tile> ();
-            for (int k = 0; k < body.length; k++) if (body[k].group == g.group) members.add (body[k]);
-            double head = double.min (GROUP_HEADER, g.h / 3), edge = double.min (GROUP_BORDER, g.w / 8);
-            layout (members, 0, members.length, g.x + edge, g.y + head, g.w - 2 * edge, g.h - head - edge);
-            for (int k = 0; k < members.length; k++) result.add (members[k]);
+    }
+
+    // A folder's tile has its place: list it, then lay out what is in it, inside its frame.
+    void enter (Tile b, Box clip) {
+        b.clip = clip;
+        laid.add (b);
+        fill (b.folder, b.inside (), clip);
+    }
+
+    // A strip: side by side (or one above the other), every stock the same size. A folder among them
+    // is as long as the stocks in it, or as one stock if it is itself a strip running the other way.
+    // A strip that scrolls stops shrinking its tiles at a readable size and runs on past its end.
+    static void strip (Group g, GenericArray<Tile> items, double x, double y, double w, double h) {
+        bool row = g.arrange == Arrange.ROW;
+        double units = 0;
+        double[] span = {};
+        for (int i = 0; i < items.length; i++) {
+            bool lengthwise = items[i].kind == TileKind.GROUP && items[i].folder.arrange != (row ? Arrange.COLUMN : Arrange.ROW);
+            span += lengthwise ? items[i].count : 1;
+            units += span[i];
         }
-        return result;
+        double room = row ? w : h, unit = room / units, least = row ? SCROLL_WIDTH : SCROLL_HEIGHT;
+        if (g.scroll && unit < least) {
+            unit = least;
+            g.overflow = unit * units - room;
+        }
+        g.offset = g.offset.clamp (0, g.overflow);
+        double at = (row ? x : y) - g.offset;
+        for (int i = 0; i < items.length; i++) {
+            var t = items[i];
+            t.x = row ? at : x;
+            t.y = row ? y : at;
+            t.w = row ? unit * span[i] : w;
+            t.h = row ? h : unit * span[i];
+            at += unit * span[i];
+        }
+    }
+
+    // A grid of equal cells: as many across as brings them nearest to a little wider than tall, which
+    // is what a label wants. A last row that comes up short is stretched to fill it.
+    static void grid (GenericArray<Tile> items, double x, double y, double w, double h) {
+        int n = items.length, across = 1;
+        double best = double.MAX;
+        for (int c = 1; c <= n; c++) {
+            double off = Math.fabs (Math.log ((w / c) / (h / ((n + c - 1) / c)) / 1.3));
+            if (off < best) { best = off; across = c; }
+        }
+        int rows = (n + across - 1) / across;
+        for (int i = 0; i < n; i++) {
+            int row = i / across, here = row == rows - 1 ? n - row * across : across;
+            items[i].x = x + w * (i % across) / here;
+            items[i].y = y + h * row / rows;
+            items[i].w = w / here;
+            items[i].h = h / rows;
+        }
+    }
+
+    // Fibonacci: the first takes half, the next half of what is left, and so on round a spiral (left,
+    // top, right, bottom); the last takes what remains.
+    static void spiral (GenericArray<Tile> items, double x, double y, double w, double h) {
+        int turn = w >= h ? 0 : 1;
+        for (int i = 0; i < items.length; i++, turn++) {
+            var t = items[i];
+            t.x = x; t.y = y; t.w = w; t.h = h;
+            if (i == items.length - 1) break;
+            if (turn % 2 == 0) {
+                t.w = w = w / 2;
+                if (turn % 4 == 0) x += w; else t.x = x + w;
+            } else {
+                t.h = h = h / 2;
+                if (turn % 4 == 1) y += h; else t.y = y + h;
+            }
+        }
     }
 
     // ponytail: binary split (halve the list by weight where it stands, cut the longer side). It keeps

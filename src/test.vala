@@ -21,6 +21,12 @@ Lot lot (string symbol, double shares, double price, int day) {
     return new Lot () { symbol = symbol, shares = shares, price = price, date = new DateTime.from_unix_utc (T0 + day * DAY).format ("%Y-%m-%d") };
 }
 
+string order (GenericArray<Tile> tiles) {
+    string names = "";
+    for (int i = 0; i < tiles.length; i++) names += tiles[i].symbol + " ";
+    return names;
+}
+
 void main () {
     // --- one quote: closes 100..109 ---
     var a = quote ("A", "USD", 100, 1);
@@ -136,74 +142,163 @@ void main () {
     near (tiles[0].w * tiles[0].h, tiles[1].w * tiles[1].h);
     assert (watch.history (Range.D7, NOW, out opening).n == 0);
 
-    // --- folders and the benchmark row ---
+    // --- folders ---
     // p holds A (1635) and J (20) and watches W. File A and J under Tech; watch an index too.
-    p.groups.add ("Tech");
-    p.assign ("A", "Tech");
-    p.assign ("J", "Tech");
-    assert (((Lot) p.lots.get_item (1)).group == "Tech");      // both lots of A moved
+    var tech = p.add_group ("Tech", p.root);
+    p.assign ("A", tech.id);
+    p.assign ("J", tech.id);
+    assert (((Lot) p.lots.get_item (1)).group == tech.id);     // both lots of A moved
     var index = quote ("^X", "USD", 5000, 10);
     index.kind = "INDEX";
     p.quotes["^X"] = index;
     p.lots.append (new Lot () { symbol = "^X" });
     p.rebase ();
     tiles = p.tiles (Range.D1, NOW, 400, 300);
-    // the index in a row along the top; then Tech with A and J; then Ungrouped with W
-    string order = "";
-    for (int i = 0; i < tiles.length; i++) order += tiles[i].symbol + " ";
-    assert (order == "^X Tech A J Ungrouped W ");
-    assert (tiles[0].kind == TileKind.BENCHMARK && tiles[1].kind == TileKind.GROUP && tiles[2].kind == TileKind.STOCK);
-    near (tiles[0].w, 400);
-    near (tiles[0].h, Portfolio.BENCHMARK_ROW);
-    near (tiles[1].y, Portfolio.BENCHMARK_ROW);
-    double rest = 400 * (300 - Portfolio.BENCHMARK_ROW);
-    near (tiles[1].w * tiles[1].h, rest * 1655 / (1655 + 827.5));                 // a folder is as big as its stocks
-    near (tiles[1].change, (1635 * (109.0 / 108 - 1) + 20 * 0) / 1655);           // and moves as their weighted average
-    near (tiles[2].y, tiles[1].y + Portfolio.GROUP_HEADER);                       // stocks start below its label
-    near (tiles[2].x, tiles[1].x + Portfolio.GROUP_BORDER);                       // and inside its frame
-    near (tiles[2].w * tiles[2].h + tiles[3].w * tiles[3].h,
-          (tiles[1].w - 2 * Portfolio.GROUP_BORDER) * (tiles[1].h - Portfolio.GROUP_HEADER - Portfolio.GROUP_BORDER));
+    // Tech with A and J in it; then what is in no folder, W and the index, as tiles of their own
+    assert (order (tiles) == "Tech A J W ^X ");
+    assert (tiles[0].kind == TileKind.GROUP && tiles[1].kind == TileKind.STOCK && tiles[4].kind == TileKind.BENCHMARK);
+    assert (tiles[0].folder == tech && tiles[1].folder == tech && tiles[3].folder == p.root && tiles[0].count == 2);
+    near (tiles[0].w * tiles[0].h, 400 * 300 * 1655 / (1655 + 2 * 827.5));        // a folder is as big as its stocks
+    near (tiles[0].change, (1635 * (109.0 / 108 - 1) + 20 * 0) / 1655);           // and moves as their weighted average
+    near (tiles[1].y, tiles[0].y + Portfolio.GROUP_HEADER);                       // stocks start below its label
+    near (tiles[1].x, tiles[0].x + Portfolio.GROUP_BORDER);                       // and inside its frame
+    near (tiles[1].w * tiles[1].h + tiles[2].w * tiles[2].h,
+          (tiles[0].w - 2 * Portfolio.GROUP_BORDER) * (tiles[0].h - Portfolio.GROUP_HEADER - Portfolio.GROUP_BORDER));
     p.gain (Range.MAX, NOW, out gain, out capital);
     near (capital, 10 * 90 + 5 * 104 + 10);                                       // none of this touches the totals
 
-    // a held index fund is a position like any other: in the body, not the top row
+    // a strip pinned along the top: one tile high, the full width, its stocks side by side and equal
+    var top = p.add_group ("Top", p.root);
+    top.arrange = Arrange.ROW;
+    p.dock_group (top, Dock.TOP);
+    p.assign ("^X", top.id);
+    p.assign ("W", top.id);
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    assert (order (tiles) == "Top W ^X Tech A J ");                               // pinned first, whatever the folders' order
+    near (tiles[0].w, 400);
+    near (tiles[0].h, Portfolio.STRIP_HEIGHT + Portfolio.GROUP_HEADER + Portfolio.GROUP_BORDER);
+    near (tiles[1].w, (400 - 2 * Portfolio.GROUP_BORDER) / 2);
+    near (tiles[1].w, tiles[2].w);
+    near (tiles[2].x, tiles[1].x + tiles[1].w);
+    near (tiles[1].h, Portfolio.STRIP_HEIGHT);
+    near (tiles[3].y, tiles[0].h);                                                // the rest starts below it
+    near (tiles[3].h, 300 - tiles[0].h);
+    // dragged to a size: that share of the height. Pinned to a side, the strip turns to run down it.
+    top.size = 0.5;
+    near (p.tiles (Range.D1, NOW, 400, 300)[0].h, 150);
+    p.dock_group (top, Dock.RIGHT);
+    assert (top.arrange == Arrange.COLUMN && top.size == 0);
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    near (tiles[0].x + tiles[0].w, 400);
+    near (tiles[0].w, 400 / 3.0);                                                 // no more than a third unless the user says so
+    near (tiles[2].y, tiles[1].y + tiles[1].h);
+    near (tiles[3].w, 400 - tiles[0].w);
+    // nothing else on the map: the pinned folder has it all
+    p.assign ("A", top.id);
+    p.assign ("J", top.id);
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    assert (order (tiles) == "Top A J W ^X ");
+    near (tiles[0].w, 400);
+    p.assign ("A", tech.id);
+    p.assign ("J", tech.id);
+
+    // a strip that scrolls keeps its tiles readable and runs on past its end
+    p.dock_group (top, Dock.TOP);
+    top.scroll = true;
+    tiles = p.tiles (Range.D1, NOW, 150, 300);
+    near (tiles[1].w, Portfolio.SCROLL_WIDTH);
+    near (top.overflow, 2 * Portfolio.SCROLL_WIDTH - (150 - 2 * Portfolio.GROUP_BORDER));
+    assert (tiles[1].covers (10, 40) && !tiles[2].covers (149, 40));              // the frame's edge cuts the second one off
+    top.offset = 1000;
+    tiles = p.tiles (Range.D1, NOW, 150, 300);
+    near (top.offset, top.overflow);                                              // no further than its end
+    near (tiles[2].x + tiles[2].w, 150 - Portfolio.GROUP_BORDER);
+    assert (!tiles[1].covers (1, 40));
+    top.scroll = false;
+    near (p.tiles (Range.D1, NOW, 150, 300)[1].w, (150 - 2 * Portfolio.GROUP_BORDER) / 2);
+
+    // folders in folders: AI inside Tech takes J with it; Tech arranges AI and its own A
+    var ai = p.add_group ("AI", tech);
+    p.assign ("J", ai.id);
+    p.dock_group (top, Dock.FLOW);
+    p.root.arrange = Arrange.COLUMN;
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    assert (order (tiles) == "Tech AI J A Top W ^X ");
+    assert (tiles[0].count == 2 && tiles[1].folder == ai && ai.within (tech) && !tech.within (ai));
+    near (tiles[0].h, 300 * 2 / 3.0);                                             // down a column: Tech is two stocks long,
+    near (tiles[4].h, 300 / 3.0);                                                 // a strip lying across it one
+    near (tiles[1].x, tiles[0].x + Portfolio.GROUP_BORDER);
+    p.move_group (tech, ai);                                                       // not into itself
+    assert (tech.parent == p.root && p.folders ().length == 3);
+    p.move_group (top, p.root, tech, false);                                       // before Tech
+    assert (p.root.children[0] == top);
+    p.move_group (top, tech, ai, true);                                            // into Tech, after AI
+    assert (top.parent == tech && tech.children[1] == top && p.root.children.length == 1);
+    p.move_group (top, p.root);
+    assert (p.folder (ai.id) == ai && p.folder ("gone") == p.root);
+
+    // a grid: equal cells, the last row stretched; Fibonacci: half, then half of the rest
+    p.root.arrange = Arrange.VALUE;
+    for (int i = 0; i < 5; i++) {
+        p.quotes[@"G$i"] = quote (@"G$i", "USD", 10, 1);
+        p.lots.append (new Lot () { symbol = @"G$i", group = top.id });
+    }
+    top.arrange = Arrange.GRID;
+    p.dock_group (top, Dock.BOTTOM);
+    top.size = 0.5;
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    int g0 = 0;
+    while (tiles[g0].symbol != "Top") g0++;
+    assert (tiles[g0].count == 7 && tiles[g0 + 1].symbol == "W");
+    near (tiles[g0 + 1].w, tiles[g0 + 2].w);
+    near (tiles[g0 + 1].h, tiles[g0 + 7].h);
+    assert (tiles[g0 + 7].w > tiles[g0 + 1].w);                                   // 7 in rows of 3 or 4: the last one is short
+    top.arrange = Arrange.FIBONACCI;
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    double inner = (400 - 2 * Portfolio.GROUP_BORDER) * (150 - Portfolio.GROUP_HEADER - Portfolio.GROUP_BORDER);
+    near (tiles[g0 + 1].w * tiles[g0 + 1].h, inner / 2);
+    near (tiles[g0 + 2].w * tiles[g0 + 2].h, inner / 4);
+    near (tiles[g0 + 7].w * tiles[g0 + 7].h, tiles[g0 + 6].w * tiles[g0 + 6].h);  // the last takes what is left
+    area = 0;
+    for (int i = g0 + 1; i <= g0 + 7; i++) area += tiles[i].w * tiles[i].h;
+    near (area, inner);
+    for (int i = 0; i < 5; i++) p.lots.remove (p.lots.get_n_items () - 1);
+
+    // a held index fund is a position like any other, and labelled like one
     ((Lot) p.lots.get_item (4)).shares = 1;
     ((Lot) p.lots.get_item (4)).price = 5000;
     p.rebase ();
     tiles = p.tiles (Range.D1, NOW, 400, 300);
-    assert (tiles[0].kind != TileKind.BENCHMARK);
+    for (int i = 0; i < tiles.length; i++) assert (tiles[i].kind != TileKind.BENCHMARK);
 
-    // deleting a folder unfiles its stocks; with no folders the map is flat again
-    p.rename_group ("Tech", "");
-    assert (p.groups.length == 0 && ((Lot) p.lots.get_item (0)).group == "");
+    // deleting a folder moves what was in it up a level; with no folders the map is flat again
+    p.remove_group (tech);
+    assert (ai.parent == p.root && p.root.children[0] == ai && ((Lot) p.lots.get_item (0)).group == "");
+    p.remove_group (ai);
+    p.remove_group (top);
+    assert (p.root.children.length == 0 && ((Lot) p.lots.get_item (2)).group == "");
     tiles = p.tiles (Range.D1, NOW, 400, 300);
     for (int i = 0; i < tiles.length; i++) assert (tiles[i].kind == TileKind.STOCK);
 
     // --- arranging by hand: the order of the list is the order of the map ---
-    // p lists A (two lots), J, W and ^X, all in the body by now.
+    // p lists A (two lots), J, W and ^X, in no folder.
     p.move ("W", "A", false);
-    order = "";
-    tiles = p.tiles (Range.D1, NOW, 400, 300);
-    for (int i = 0; i < tiles.length; i++) order += tiles[i].symbol + " ";
-    assert (order == "W A J ^X ");
+    assert (order (p.tiles (Range.D1, NOW, 400, 300)) == "W A J ^X ");
     p.move ("A", "^X", true);                                                         // both lots of A go, and stay together
-    order = "";
-    for (uint i = 0; i < p.lots.get_n_items (); i++) order += ((Lot) p.lots.get_item (i)).symbol + " ";
-    assert (order == "W J ^X A A ");
+    string listed = "";
+    for (uint i = 0; i < p.lots.get_n_items (); i++) listed += ((Lot) p.lots.get_item (i)).symbol + " ";
+    assert (listed == "W J ^X A A ");
     near (((Lot) p.lots.get_item (3)).shares, 10);                                      // in the order they were in
     p.move ("W", "nowhere", false);                                                     // no such neighbour: the end
     assert (((Lot) p.lots.get_item (4)).symbol == "W");
-    foreach (var folder in new string[] { "One", "Two", "Three" }) p.groups.add (folder);
-    p.move_group ("Three", "One");
-    assert (p.groups[0] == "Three" && p.groups[1] == "One" && p.groups[2] == "Two");
-    p.move_group ("Three", "");
-    assert (p.groups[0] == "One" && p.groups[2] == "Three");
-    p.assign ("J", "Three");
-    p.assign ("W", "One");
-    tiles = p.tiles (Range.D1, NOW, 400, 300);
-    order = "";
-    for (int i = 0; i < tiles.length; i++) order += tiles[i].symbol + " ";
-    assert (order == "One W Three J Ungrouped ^X A ");                                  // folders in their order, empty ones absent
+    var one = p.add_group ("One", p.root);
+    p.add_group ("Two", p.root);
+    var three = p.add_group ("Three", p.root);
+    p.move_group (three, p.root, one, false);
+    assert (p.root.children[0] == three && p.root.children[1] == one);
+    p.assign ("J", three.id);
+    p.assign ("W", one.id);
+    assert (order (p.tiles (Range.D1, NOW, 400, 300)) == "Three J One W ^X A ");        // folders in their order, empty ones absent
 
     // --- keeping history between runs: merging, spotting a rewritten past, and the cache itself ---
     var c = quote ("C", "USD", 100, 1);
