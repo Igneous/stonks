@@ -157,6 +157,9 @@ public class Window : Adw.ApplicationWindow {
             update ();
         });
         add_action (delete_folder);
+        var add_to = new SimpleAction ("add-to", VariantType.STRING);
+        add_to.activate.connect ((name) => add_dialog (new Lot () { group = name.get_string () }));
+        add_action (add_to);
         var move = new SimpleAction ("move", new VariantType ("(ss)"));
         move.activate.connect ((target) => {
             string symbol, folder;
@@ -370,6 +373,10 @@ public class Window : Adw.ApplicationWindow {
             });
             folder.add_controller (drop);
             if (name != "") {
+                folder.add_suffix (new Gtk.Button.from_icon_name ("list-add-symbolic") {
+                    tooltip_text = "Add a stock to this folder", valign = Gtk.Align.CENTER, css_classes = { "flat" },
+                    action_name = "win.add-to", action_target = new Variant.string (name)
+                });
                 var actions = new Menu ();
                 actions.append_item (menu_item ("Rename…", "win.rename-folder", new Variant.string (name)));
                 actions.append_item (menu_item ("Delete", "win.delete-folder", new Variant.string (name)));
@@ -508,9 +515,18 @@ public class Window : Adw.ApplicationWindow {
         position.add (shares);
         position.add (date);
         position.add (price);
+        // Optional too: file it in a heatmap folder straight away. Row 0 is "None".
+        var choices = new Gtk.StringList (null);
+        choices.append ("None");
+        for (int i = 0; i < p.groups.length; i++) choices.append (p.groups[i]);
+        var folder = new Adw.ComboRow () { title = "Folder", subtitle = "Where it sits on the heatmap", model = choices };
+        for (int i = 0; draft != null && i < p.groups.length; i++) if (p.groups[i] == draft.group) folder.selected = i + 1;
+        var filing = new Adw.PreferencesGroup () { visible = p.groups.length > 0 };
+        filing.add (folder);
         var form = new Gtk.Box (Gtk.Orientation.VERTICAL, 24) { margin_top = 12, margin_bottom = 24, margin_start = 24, margin_end = 24 };
         form.append (stock);
         form.append (position);
+        form.append (filing);
 
         var add = new Gtk.Button.with_label ("Add") { css_classes = { "suggested-action" }, sensitive = false };
         var cancel = new Gtk.Button.with_label ("Cancel");
@@ -536,7 +552,7 @@ public class Window : Adw.ApplicationWindow {
                 return;
             }
             Timeout.add (250, () => {
-                if (mine == serial) feed.search.begin (text, (obj, res) => {
+                if (mine == serial) feed.search.begin (text, p.currency, (obj, res) => {
                     var found = feed.search.end (res);
                     if (mine != serial) return;
                     hits.remove_all ();
@@ -544,9 +560,14 @@ public class Window : Adw.ApplicationWindow {
                         var row = new Adw.ActionRow () { use_markup = false, title = hit.symbol, subtitle = hit.name + "\n" + hit.detail, activatable = true };
                         // On the right: the price now and, where there is one, the market cap.
                         if (hit.price.is_finite ()) {
-                            // Penny stocks and small coins would all read 0.00 at two decimals.
-                            var numbers = "%s %s".printf (hit.price < 1 ? "%.4g".printf (hit.price) : money (hit.price, hit.currency), hit.currency);
-                            if (hit.cap.is_finite ()) numbers += "\n<span alpha='65%%'><small>Mkt cap %s</small></span>".printf (compact (hit.cap));
+                            // In its own currency, then (if that isn't ours and we know the rate) in ours.
+                            var numbers = price_text (hit.price, hit.currency);
+                            if (hit.rate.is_finite ()) numbers += " (%s)".printf (price_text (hit.price * hit.rate, p.currency));
+                            if (hit.cap.is_finite ()) {
+                                var cap = compact (hit.cap);
+                                if (hit.rate.is_finite ()) cap += " (%s %s)".printf (compact (hit.cap * hit.rate), p.currency);
+                                numbers += "\n<span alpha='65%%'><small>Mkt cap %s</small></span>".printf (cap);
+                            }
                             row.add_suffix (new Gtk.Label (numbers) { use_markup = true, xalign = 1, justify = Gtk.Justification.RIGHT, css_classes = { "numeric" } });
                         }
                         hits.append (row);
@@ -592,10 +613,18 @@ public class Window : Adw.ApplicationWindow {
         if (draft != null && draft.shares > 0) shares.text = "%.8g".printf (draft.shares);
         cancel.clicked.connect (() => { dialog.close (); });
         add.clicked.connect (() => {
+            lot.group = folder.selected > 0 ? p.groups[(int) folder.selected - 1] : "";
             dialog.close ();
             add_lot.begin (lot);
         });
         dialog.present (this);
+    }
+
+    // "264.00 USD". Penny stocks and small coins would all read 0.00 at two decimals, so they get four digits.
+    string price_text (double price, string currency) {
+        var number = "%.4g".printf (price);
+        if (price >= 1) number = money (price, currency);
+        return @"$number $currency";
     }
 
     void mark (Adw.EntryRow row, bool ok) {
@@ -638,13 +667,15 @@ public class Window : Adw.ApplicationWindow {
             return;
         }
         // A stock is listed once unless it's bought more than once: a purchase takes over the stock's
-        // watch-only row, and watching something already listed changes nothing.
+        // watch-only row, and watching something already listed changes nothing but its folder.
+        var chosen = lot.group;
         for (uint i = 0; i < p.lots.get_n_items (); i++) {
             var other = (Lot) p.lots.get_item (i);
             if (other.symbol != lot.symbol) continue;
-            lot.group = other.group;   // a symbol has one folder, whichever lot it came with
+            if (chosen == "") lot.group = other.group;   // a symbol has one folder: without a new choice, the one it has
             if (lot.shares <= 0) {
-                toasts.add_toast (new Adw.Toast (@"$(lot.symbol) is already listed"));
+                if (chosen != "" && chosen != other.group) file (lot.symbol, chosen);
+                else toasts.add_toast (new Adw.Toast (@"$(lot.symbol) is already listed"));
                 return;
             }
             if (other.shares <= 0) {
@@ -654,6 +685,7 @@ public class Window : Adw.ApplicationWindow {
         }
         if (lot.shares > 0 && lot.price <= 0) lot.price = q.daily.v[q.bar (lot.ts (q.gmtoffset))];
         p.lots.append (lot);
+        if (chosen != "") p.assign (lot.symbol, chosen);   // earlier lots of it follow
         save ();
         sync ();
         update ();

@@ -19,6 +19,7 @@ public class Hit {
     public string currency = "";
     public double price = double.NAN;   // NaN where the source has none
     public double cap = double.NAN;     // market capitalisation, in `currency`
+    public double rate = double.NAN;    // times this is the totals currency; NaN if it already is, or unknown
 }
 
 public class Feed {
@@ -28,10 +29,11 @@ public class Feed {
     // Yahoo answers 429 to user agents that don't look like a browser.
     Soup.Session session = new Soup.Session () { user_agent = "Mozilla/5.0 (X11; Linux x86_64)", timeout = 30 };
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
-    string? crumb;                      // see price_hits()
+    string? crumb;                      // see quote_batch()
+    HashTable<string, double?> per_usd = new HashTable<string, double?> (str_hash, str_equal);   // see rate_hits()
 
     public Feed () {
-        session.add_feature (new Soup.CookieJar ());   // for the cookie price_hits() needs
+        session.add_feature (new Soup.CookieJar ());   // for the cookie quote_batch() needs
     }
 
     async Json.Object get_json (string url) throws Error {
@@ -97,7 +99,14 @@ public class Feed {
     // matches by name or ticker.
     // ponytail: Vietnamese companies are found by ticker only; searching them by name needs a symbol
     // list (trading.vietcap.com.vn/api/price/symbols/getAll has one) filtered here.
-    public async Hit[] search (string text) {
+    // Prices and market caps come in the security's own currency, with `into` as a second opinion.
+    public async Hit[] search (string text, string into) {
+        var hits = yield find (text);
+        yield rate_hits (hits, into);
+        return hits;
+    }
+
+    async Hit[] find (string text) {
         Hit[] hits = {};
         yield load_names ();   // normally there already; this retries if we started offline
 
@@ -161,34 +170,59 @@ public class Feed {
     async void price_hits (Hit[] hits) {
         string[] symbols = {};
         foreach (var hit in hits) if (!hit.price.is_finite ()) symbols += hit.symbol;
-        if (symbols.length == 0) return;
+        var quotes = yield quote_batch (symbols, "regularMarketPrice,currency,marketCap,longName,shortName,fullExchangeName,typeDisp");
+        for (uint i = 0; quotes != null && i < quotes.get_length (); i++) {
+            var o = quotes.get_object_element (i);
+            foreach (var hit in hits) {
+                if (hit.symbol != o.get_string_member_with_default ("symbol", "")) continue;
+                hit.currency = o.get_string_member_with_default ("currency", "");
+                hit.price = o.get_double_member_with_default ("regularMarketPrice", double.NAN);
+                hit.cap = o.get_double_member_with_default ("marketCap", double.NAN);   // funds and warrants have none
+                if (hit.name == "") {   // a pair we guessed the symbol of, rather than a search result
+                    hit.name = o.get_string_member_with_default ("longName", o.get_string_member_with_default ("shortName", hit.symbol));
+                    hit.detail = "%s · %s".printf (o.get_string_member_with_default ("fullExchangeName", ""), o.get_string_member_with_default ("typeDisp", ""));
+                }
+            }
+        }
+    }
+
+    // Yahoo's quote endpoint for several symbols at once; null if it can't be had right now.
+    async Json.Array? quote_batch (string[] symbols, string fields) {
+        if (symbols.length == 0) return null;
         try {
             if (crumb == null) {
                 yield session.send_and_read_async (new Soup.Message ("GET", "https://fc.yahoo.com"), Priority.DEFAULT, null);   // a 404 that sets the cookie
                 var reply = yield session.send_and_read_async (new Soup.Message ("GET", "https://query2.finance.yahoo.com/v1/test/getcrumb"), Priority.DEFAULT, null);
                 crumb = reply.get_size () > 0 ? ((string) reply.get_data ()).substring (0, (long) reply.get_size ()) : "";
             }
-            var root = yield get_json (@"$YAHOO/v7/finance/quote?fields=regularMarketPrice,currency,marketCap,longName,shortName,fullExchangeName,typeDisp&crumb=$(Uri.escape_string (crumb))&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
-            if (!root.has_member ("quoteResponse")) {
-                crumb = null;   // refused: the crumb went stale, so get a new one next time
-                return;
-            }
-            var quotes = root.get_object_member ("quoteResponse").get_array_member ("result");
-            for (uint i = 0; i < quotes.get_length (); i++) {
-                var o = quotes.get_object_element (i);
-                foreach (var hit in hits) {
-                    if (hit.symbol != o.get_string_member_with_default ("symbol", "")) continue;
-                    hit.currency = o.get_string_member_with_default ("currency", "");
-                    hit.price = o.get_double_member_with_default ("regularMarketPrice", double.NAN);
-                    hit.cap = o.get_double_member_with_default ("marketCap", double.NAN);   // funds and warrants have none
-                    if (hit.name == "") {   // a pair we guessed the symbol of, rather than a search result
-                        hit.name = o.get_string_member_with_default ("longName", o.get_string_member_with_default ("shortName", hit.symbol));
-                        hit.detail = "%s · %s".printf (o.get_string_member_with_default ("fullExchangeName", ""), o.get_string_member_with_default ("typeDisp", ""));
-                    }
+            var root = yield get_json (@"$YAHOO/v7/finance/quote?fields=$fields&crumb=$(Uri.escape_string (crumb))&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
+            if (root.has_member ("quoteResponse")) return root.get_object_member ("quoteResponse").get_array_member ("result");
+        } catch (Error e) {}
+        crumb = null;   // refused or unreachable: the crumb may have gone stale, so get a new one next time
+        return null;
+    }
+
+    // Give each hit priced in another currency the rate into `into`, so the list can show both.
+    // Rates are asked for once per currency per session: a search result needs them no fresher.
+    async void rate_hits (Hit[] hits, string into) {
+        string[] wanted = {};
+        foreach (var hit in hits) {
+            foreach (var currency in new string[] { hit.currency, into })
+                if (currency != "" && currency != "USD" && currency == currency.up () && !per_usd.contains (currency)) {
+                    per_usd[currency] = double.NAN;   // asked for; also keeps it out of this list twice
+                    wanted += "USD" + currency + "=X";
                 }
-            }
-        } catch (Error e) {
-            crumb = null;
+        }
+        var quotes = yield quote_batch (wanted, "regularMarketPrice");
+        for (uint i = 0; quotes != null && i < quotes.get_length (); i++) {
+            var o = quotes.get_object_element (i);
+            var pair = o.get_string_member_with_default ("symbol", "");
+            if (pair.length == 8) per_usd[pair[3:6]] = o.get_double_member_with_default ("regularMarketPrice", double.NAN);
+        }
+        per_usd["USD"] = 1;
+        foreach (var hit in hits) {
+            if (hit.currency == into || !per_usd.contains (hit.currency) || !per_usd.contains (into)) continue;
+            hit.rate = per_usd[into] / per_usd[hit.currency];   // NaN if either rate never arrived
         }
     }
 
