@@ -33,11 +33,15 @@ public class Quote {
     public string symbol = "";
     public string name = "";
     public string currency = "";
+    public string kind = "";                 // EQUITY, ETF, INDEX, CURRENCY, CRYPTOCURRENCY, FUTURE, MUTUALFUND
     public int gmtoffset;                    // exchange timezone, seconds east of UTC
     public double price;
     public double prev_close = double.NAN;   // previous session's close when the feed states one; NaN = derive it from daily
     public Series daily = new Series ();     // full history, 1d bars; the last bar is the live session
     public Series intra = new Series ();     // last 7 days, 5m bars
+
+    // One company's shares, as opposed to an index, a fund, a currency pair or a commodity.
+    public bool is_stock { get { return kind == "" || kind == "EQUITY"; } }
 
     // Where a range begins. 1D is the exchange's latest session, not the last 24 hours.
     public int64 start (Range r, int64 now) {
@@ -95,7 +99,7 @@ public class Quote {
     // ponytail: a daily bar takes the FX close of the same UTC date, so exchanges that open before
     // 00:00 UTC (Sydney, Wellington) convert with the previous day's rate. Fine for US/Asia.
     public Quote times (Quote fx, bool invert) {
-        var c = new Quote () { symbol = symbol, name = name, currency = currency, gmtoffset = gmtoffset };
+        var c = new Quote () { symbol = symbol, name = name, currency = currency, kind = kind, gmtoffset = gmtoffset };
         c.price = scale (price, fx.price, invert);
         for (int i = 0; i < daily.n; i++) c.daily.add (daily.t[i], scale (daily.v[i], fx.daily.at (daily.t[i]), invert));
         for (int i = 0; i < intra.n; i++) c.intra.add (intra.t[i], scale (intra.v[i], fx.rate (intra.t[i]), invert));
@@ -116,6 +120,7 @@ public class Lot : Object {
     public double shares { get; set; }                // 0 = watched only: date and price mean nothing
     public double price { get; set; }                // paid per share, in the instrument's own currency
     public string date { get; set; default = ""; }   // YYYY-MM-DD
+    public string group { get; set; default = ""; }  // the heatmap folder its symbol is filed in, if any
 
     // Midnight of the buy date at an exchange `gmtoffset` seconds east of UTC.
     public int64 ts (int gmtoffset) {
@@ -124,13 +129,24 @@ public class Lot : Object {
     }
 }
 
-// A treemap cell: one tracked symbol.
+public enum TileKind {
+    STOCK,       // in the body of the treemap
+    BENCHMARK,   // an index, fund, currency pair or commodity that is only watched: the row along the top
+    GROUP        // a folder: the region its stocks are laid out in
+}
+
+// A treemap cell: one tracked symbol, or a folder of them.
 public class Tile {
-    public string symbol;
+    public TileKind kind;
+    public string symbol;   // a GROUP's is the folder name
     public string name;
+    public string group = "";
+    public string currency = "";
+    public double price;    // the instrument's own
+    public double shares;
     public double value;    // held, in the portfolio currency; 0 if only watched
     public double weight;   // what sizes the tile: value, or a stand-in for watched symbols
-    public double change;   // the instrument's own price change over the range
+    public double change;   // the instrument's own price change over the range; a GROUP's is its stocks' average
     public double x;
     public double y;
     public double w;
@@ -144,6 +160,30 @@ public class Portfolio {
     // The held ones repriced into `currency`. Derived: call rebase() after quotes or currency change.
     public HashTable<string, Quote> converted = new HashTable<string, Quote> (str_hash, str_equal);
     public string currency = "USD";
+    // Heatmap folders, in the user's order. Kept here as well as on the lots so an empty one survives.
+    public GenericArray<string> groups = new GenericArray<string> ();
+
+    public const double GROUP_HEADER = 22;    // pixels kept free at the top of a folder's region for its label
+    public const double BENCHMARK_ROW = 64;   // height of the row along the top
+
+    // File a symbol (every lot of it) in a folder; "" takes it out.
+    public void assign (string symbol, string group) {
+        for (uint i = 0; i < lots.get_n_items (); i++) {
+            var l = (Lot) lots.get_item (i);
+            if (l.symbol == symbol) l.group = group;
+        }
+    }
+
+    // Rename a folder, or with "" as the new name delete it and unfile its stocks.
+    public void rename_group (string old, string name) {
+        uint at;
+        if (!groups.find_with_equal_func (old, str_equal, out at)) return;
+        if (name == "") groups.remove_index (at); else groups[at] = name;
+        for (uint i = 0; i < lots.get_n_items (); i++) {
+            var l = (Lot) lots.get_item (i);
+            if (l.group == old) l.group = name;
+        }
+    }
 
     static string? usd_pair (string cur) { return cur == "USD" ? null : cur + "USD=X"; }
 
@@ -251,31 +291,91 @@ public class Portfolio {
         return s;
     }
 
-    // One tile per tracked symbol, biggest first, laid out to fill w x h. Holdings are sized by value;
-    // a watched symbol has none, so it gets the average holding's size (equal sizes if nothing is held).
+    static int by_weight (Tile a, Tile b) {
+        return a.weight < b.weight ? 1 : (a.weight > b.weight ? -1 : strcmp (a.symbol, b.symbol));
+    }
+
+    // The heatmap, laid out to fill w x h: one tile per tracked symbol.
+    //  - Indices, funds, currency pairs and commodities that are only watched are context rather than
+    //    positions: they sit side by side in a row along the top.
+    //  - Everything else fills the rest, sized by value. A watched stock has no value, so it gets the
+    //    average holding's size (equal sizes if nothing is held).
+    //  - If any stock is filed in a folder, each folder becomes a region (a GROUP tile, listed just
+    //    before its stocks) with unfiled stocks sharing one called "Ungrouped".
     public GenericArray<Tile> tiles (Range r, int64 now, double w, double h) {
         var by_symbol = new HashTable<string, Tile> (str_hash, str_equal);
-        var list = new GenericArray<Tile> ();
+        var all = new GenericArray<Tile> ();
         for (uint i = 0; i < lots.get_n_items (); i++) {
             var l = (Lot) lots.get_item (i);
             var q = quotes[l.symbol];
             if (q == null) continue;
             var t = by_symbol[l.symbol];
             if (t == null) {
-                t = new Tile () { symbol = l.symbol, name = q.name, change = q.change (r, now) };
+                t = new Tile () { symbol = l.symbol, name = q.name, group = l.group, currency = q.currency, price = q.price, change = q.change (r, now) };
                 by_symbol[l.symbol] = t;
-                list.add (t);
+                all.add (t);
             }
+            t.shares += l.shares;
             var c = converted[l.symbol];
             if (c != null) t.value += l.shares * c.price;
         }
+
+        var result = new GenericArray<Tile> ();
+        var body = new GenericArray<Tile> ();
+        for (int i = 0; i < all.length; i++) {
+            all[i].kind = !quotes[all[i].symbol].is_stock && all[i].shares <= 0 ? TileKind.BENCHMARK : TileKind.STOCK;
+            if (all[i].kind == TileKind.BENCHMARK) result.add (all[i]); else body.add (all[i]);
+        }
+        double top = result.length > 0 ? double.min (BENCHMARK_ROW, h / 4) : 0;
+        for (int i = 0; i < result.length; i++) {
+            result[i].x = w * i / result.length;
+            result[i].w = w / result.length;
+            result[i].h = top;
+        }
+
         double total = 0;
         int held = 0;
-        for (int i = 0; i < list.length; i++) if (list[i].value > 0) { total += list[i].value; held++; }
-        for (int i = 0; i < list.length; i++) list[i].weight = list[i].value > 0 ? list[i].value : (held > 0 ? total / held : 1);
-        list.sort ((a, b) => a.weight < b.weight ? 1 : (a.weight > b.weight ? -1 : strcmp (a.symbol, b.symbol)));
-        layout (list, 0, list.length, 0, 0, w, h);
-        return list;
+        bool grouped = false;
+        for (int i = 0; i < body.length; i++) {
+            grouped |= body[i].group != "";
+            if (body[i].value > 0) { total += body[i].value; held++; }
+        }
+        for (int i = 0; i < body.length; i++) body[i].weight = body[i].value > 0 ? body[i].value : (held > 0 ? total / held : 1);
+        if (!grouped) {
+            body.sort (by_weight);
+            layout (body, 0, body.length, 0, top, w, h - top);
+            for (int i = 0; i < body.length; i++) result.add (body[i]);
+            return result;
+        }
+
+        var regions = new GenericArray<Tile> ();
+        var by_group = new HashTable<string, Tile> (str_hash, str_equal);
+        for (int i = 0; i < body.length; i++) {
+            var t = body[i];
+            var g = by_group[t.group];
+            if (g == null) {
+                g = new Tile () { kind = TileKind.GROUP, symbol = t.group != "" ? t.group : "Ungrouped", name = "", group = t.group };
+                by_group[t.group] = g;
+                regions.add (g);
+            }
+            g.value += t.value;
+            g.weight += t.weight;
+            g.change += t.weight * t.change;
+        }
+        regions.sort (by_weight);
+        layout (regions, 0, regions.length, 0, top, w, h - top);
+        for (int i = 0; i < regions.length; i++) {
+            var g = regions[i];
+            g.change /= g.weight;
+            result.add (g);
+            var members = new GenericArray<Tile> ();
+            for (int k = 0; k < body.length; k++) if (body[k].group == g.group) members.add (body[k]);
+            members.sort (by_weight);
+            double head = double.min (GROUP_HEADER, g.h / 3);
+            layout (members, 0, members.length, g.x, g.y + head, g.w, g.h - head);
+            for (int k = 0; k < members.length; k++) result.add (members[k]);
+        }
+        return result;
     }
 
     // ponytail: binary split (halve the list by weight, cut the longer side). Tiles stay reasonably

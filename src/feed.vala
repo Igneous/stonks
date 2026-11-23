@@ -2,7 +2,8 @@
 //
 //   Yahoo Finance   everything but Vietnam. These are the chart and search endpoints finance.yahoo.com
 //                   itself calls; Yahoo retired its official API in 2017 and there is no key to get.
-//   SSI iBoard      every .VN symbol. Yahoo lists Ho Chi Minh (HOSE) only; this Vietnamese broker's web
+//   SSI iBoard      every .VN symbol, indices included (^VNINDEX.VN, ^VN30.VN, ^HNXINDEX.VN: Yahoo has
+//                   one day of history for them). Yahoo lists Ho Chi Minh (HOSE) only; this broker's web
 //                   terminal also has Hanoi (HNX) and UPCoM, with history back to 2006.
 //                   Drop-in alternatives that returned identical bars when this was written:
 //                   services.entrade.com.vn/chart-api/v2/ohlcs/stock and dchart-api.vndirect.com.vn/dchart/history.
@@ -13,8 +14,8 @@ namespace Stonks {
 // A search result.
 public class Hit {
     public string symbol;
-    public string name;     // as full as we can get it: "Alphabet Inc. - Class C Capital Stock"
-    public string detail;   // exchange, type, sector, industry
+    public string name = "";     // as full as we can get it: "Alphabet Inc. - Class C Capital Stock"
+    public string detail = "";   // exchange, type, sector, industry
     public string currency = "";
     public double price = double.NAN;   // NaN where the source has none
     public double cap = double.NAN;     // market capitalisation, in `currency`
@@ -59,14 +60,16 @@ public class Feed {
         return s;
     }
 
+    static bool from_ssi (string symbol) { return symbol.has_suffix (".VN"); }
+
     // A symbol's whole daily history, then its latest bars.
     public async Quote fetch (string symbol) throws Error {
-        return symbol.has_suffix (".VN") ? yield fetch_ssi (symbol) : yield fetch_yahoo (symbol);
+        return from_ssi (symbol) ? yield fetch_ssi (symbol) : yield fetch_yahoo (symbol);
     }
 
     // Latest price and the last week of 5-minute bars.
     public async void refresh (Quote q) throws Error {
-        if (q.symbol.has_suffix (".VN")) yield refresh_ssi (q); else yield refresh_yahoo (q);
+        if (from_ssi (q.symbol)) yield refresh_ssi (q); else yield refresh_yahoo (q);
     }
 
     // Full names of US-listed securities, from Nasdaq Trader's symbol directory. Yahoo calls every share
@@ -97,25 +100,35 @@ public class Feed {
     public async Hit[] search (string text) {
         Hit[] hits = {};
         yield load_names ();   // normally there already; this retries if we started offline
+
+        // A pair written the way people write them, USD->VND or BTC/USD: Yahoo files currencies as
+        // USDVND=X and crypto as BTC-USD, so offer whichever of the two it actually quotes.
+        var sides = text.up ().replace ("->", "/").replace ("→", "/").replace (" ", "").split ("/");
+        if (sides.length == 2 && sides[0].length >= 3 && sides[1].length >= 3) {
+            Hit[] pair = { new Hit () { symbol = sides[0] + sides[1] + "=X" }, new Hit () { symbol = sides[0] + "-" + sides[1] } };
+            yield price_hits (pair);
+            foreach (var hit in pair) if (hit.price.is_finite ()) hits += hit;
+            if (hits.length > 0) return hits;
+        }
         var code = text.up ();
         if (code.has_suffix (".VN")) code = code[0:code.length - 3];
         bool plausible = code.length >= 3 && code.length <= 8;
         for (int i = 0; i < code.length; i++) plausible &= code[i].isalnum ();
         if (plausible) {
             var info = yield ssi_info (code);
-            if (info != null) {
-                var hit = new Hit () {
-                    symbol = code + ".VN",
-                    name = info.get_string_member_with_default ("companyNameEn", code),
-                    detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ()),
-                    currency = "VND",
-                    price = info.get_double_member_with_default ("refPrice", double.NAN)   // yesterday's close, unless...
-                };
+            bool index = code == "VNINDEX" || code == "VN30" || code == "HNXINDEX";
+            if (info != null || index) {
+                var hit = new Hit () { symbol = index ? "^" + code + ".VN" : code + ".VN", name = code, detail = "Index · Vietnam", currency = "VND" };
+                if (info != null) {
+                    hit.name = info.get_string_member_with_default ("companyNameEn", code);
+                    hit.detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ());
+                    hit.price = info.get_double_member_with_default ("refPrice", double.NAN);   // yesterday's close, unless...
+                }
                 try {
-                    var bars = yield ssi_bars (code, "5", get_real_time () / 1000000 - 7 * 86400);
-                    if (bars.n > 0) hit.price = bars.v[bars.n - 1];                          // ...it has traded since
+                    var bars = yield ssi_bars (hit.symbol, "5", get_real_time () / 1000000 - 7 * 86400);
+                    if (bars.n > 0) hit.price = bars.v[bars.n - 1];                               // ...it has traded since
                 } catch (Error e) {}
-                hit.cap = hit.price * info.get_double_member_with_default ("listedShare", double.NAN);
+                if (info != null) hit.cap = hit.price * info.get_double_member_with_default ("listedShare", double.NAN);
                 hits += hit;
             }
         }
@@ -124,8 +137,9 @@ public class Feed {
             var quotes = root.has_member ("quotes") ? root.get_array_member ("quotes") : new Json.Array ();
             for (uint i = 0; i < quotes.get_length (); i++) {
                 var o = quotes.get_object_element (i);
-                if (!o.has_member ("symbol") || o.get_string_member ("symbol") == code + ".VN") continue;   // already listed above
+                if (!o.has_member ("symbol")) continue;
                 var symbol = o.get_string_member ("symbol");
+                if (hits.length > 0 && hits[0].symbol == symbol) continue;   // the Vietnamese match, already listed
                 string? full = names != null ? names[symbol] : null;
                 string[] facts = {};
                 foreach (var key in new string[] { "exchDisp", "typeDisp", "sectorDisp", "industryDisp" })
@@ -154,7 +168,7 @@ public class Feed {
                 var reply = yield session.send_and_read_async (new Soup.Message ("GET", "https://query2.finance.yahoo.com/v1/test/getcrumb"), Priority.DEFAULT, null);
                 crumb = reply.get_size () > 0 ? ((string) reply.get_data ()).substring (0, (long) reply.get_size ()) : "";
             }
-            var root = yield get_json (@"$YAHOO/v7/finance/quote?fields=regularMarketPrice,currency,marketCap&crumb=$(Uri.escape_string (crumb))&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
+            var root = yield get_json (@"$YAHOO/v7/finance/quote?fields=regularMarketPrice,currency,marketCap,longName,shortName,fullExchangeName,typeDisp&crumb=$(Uri.escape_string (crumb))&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
             if (!root.has_member ("quoteResponse")) {
                 crumb = null;   // refused: the crumb went stale, so get a new one next time
                 return;
@@ -167,6 +181,10 @@ public class Feed {
                     hit.currency = o.get_string_member_with_default ("currency", "");
                     hit.price = o.get_double_member_with_default ("regularMarketPrice", double.NAN);
                     hit.cap = o.get_double_member_with_default ("marketCap", double.NAN);   // funds and warrants have none
+                    if (hit.name == "") {   // a pair we guessed the symbol of, rather than a search result
+                        hit.name = o.get_string_member_with_default ("longName", o.get_string_member_with_default ("shortName", hit.symbol));
+                        hit.detail = "%s · %s".printf (o.get_string_member_with_default ("fullExchangeName", ""), o.get_string_member_with_default ("typeDisp", ""));
+                    }
                 }
             }
         } catch (Error e) {
@@ -194,12 +212,14 @@ public class Feed {
     // Prices are split-adjusted; dividends are not included.
     async Quote fetch_yahoo (string symbol) throws Error {
         var now = get_real_time () / 1000000;
-        // period1 is 1900: asking for range=max instead silently returns 3-month bars.
-        var result = yield chart (symbol, @"period1=-2208988800&period2=$now&interval=1d");
+        // Everything, by dates: range=max silently returns 3-month bars instead. 36,000 days because
+        // Yahoo refuses more than 100 years of daily bars for some symbols (^VNINDEX.VN).
+        var result = yield chart (symbol, @"period1=$(now - 36000 * (int64) 86400)&period2=$now&interval=1d");
         var meta = result.get_object_member ("meta");
         var q = new Quote () {
             symbol = symbol,
             currency = meta.get_string_member_with_default ("currency", ""),
+            kind = meta.get_string_member_with_default ("instrumentType", ""),
             gmtoffset = (int) meta.get_int_member_with_default ("gmtoffset", 0),
             daily = closes (result)
         };
@@ -222,14 +242,17 @@ public class Feed {
 
     // ---- Vietnam (SSI) ----
 
-    // Closes for a ticker, without the .VN. SSI quotes in thousands of dong, and adjusts history for
-    // dividends as well as splits, so (unlike Yahoo's) these series are total-return.
-    async Series ssi_bars (string code, string resolution, int64 from) throws Error {
+    // PVS.VN is PVS to SSI, and the index ^VN30.VN is VN30.
+    static string ssi_code (string symbol) { return symbol[(symbol.has_prefix ("^") ? 1 : 0):symbol.length - 3]; }
+
+    // Closes for a .VN symbol. SSI quotes shares in thousands of dong (indices in plain points), and
+    // adjusts history for dividends as well as splits, so (unlike Yahoo's) these series are total-return.
+    async Series ssi_bars (string symbol, string resolution, int64 from) throws Error {
         var now = get_real_time () / 1000000;
-        var root = yield get_json (@"$SSI_BARS?resolution=$resolution&symbol=$(Uri.escape_string (code))&from=$from&to=$now");
+        var root = yield get_json (@"$SSI_BARS?resolution=$resolution&symbol=$(Uri.escape_string (ssi_code (symbol)))&from=$from&to=$now");
         var data = root.has_member ("data") && !root.get_null_member ("data") ? root.get_object_member ("data") : null;
         if (data == null || !data.has_member ("t") || !data.has_member ("c")) return new Series ();
-        return series (data.get_array_member ("t"), data.get_array_member ("c"), 1000);
+        return series (data.get_array_member ("t"), data.get_array_member ("c"), symbol.has_prefix ("^") ? 1 : 1000);
     }
 
     // Name and board of a ticker, or null if SSI doesn't list it (or can't be reached).
@@ -243,12 +266,17 @@ public class Feed {
     }
 
     async Quote fetch_ssi (string symbol) throws Error {
-        var code = symbol[0:symbol.length - 3];
-        var q = new Quote () { symbol = symbol, name = code, currency = "VND", gmtoffset = 7 * 3600 };
-        q.daily = yield ssi_bars (code, "1D", 0);
+        var code = ssi_code (symbol);
+        bool index = symbol.has_prefix ("^");
+        var q = new Quote () { symbol = symbol, name = code, currency = "VND", kind = index ? "INDEX" : "EQUITY", gmtoffset = 7 * 3600 };
+        q.daily = yield ssi_bars (symbol, "1D", 0);
         if (q.daily.n == 0) throw new IOError.FAILED ("no data found on Vietnam's exchanges");   // unknown tickers come back empty
-        var info = yield ssi_info (code);
-        if (info != null) q.name = info.get_string_member_with_default ("companyNameEn", code);
+        Json.Object? info = null;
+        if (!index) info = yield ssi_info (code);
+        if (info != null) {
+            q.name = info.get_string_member_with_default ("companyNameEn", code);
+            q.kind = info.get_string_member_with_default ("stockType", "s") == "e" ? "ETF" : "EQUITY";
+        }
         yield refresh_ssi (q);
         return q;
     }
@@ -256,7 +284,7 @@ public class Feed {
     // prev_close stays NaN: the daily series' previous bar is already the day's reference price.
     async void refresh_ssi (Quote q) throws Error {
         var now = get_real_time () / 1000000;
-        q.intra = yield ssi_bars (q.symbol[0:q.symbol.length - 3], "5", now - 7 * 86400);
+        q.intra = yield ssi_bars (q.symbol, "5", now - 7 * 86400);
         if (q.intra.n > 0) q.tick (q.intra.v[q.intra.n - 1], q.intra.t[q.intra.n - 1]);
         else q.price = q.daily.v[q.daily.n - 1];
     }

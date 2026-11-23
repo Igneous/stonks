@@ -25,8 +25,9 @@ public class Treemap : Gtk.DrawingArea {
         query_tooltip.connect ((x, y, keyboard, tip) => {
             for (int i = 0; i < tiles.length; i++) {
                 var t = tiles[i];
-                if (x < t.x || x >= t.x + t.w || y < t.y || y >= t.y + t.h) continue;
+                if (t.kind == TileKind.GROUP || x < t.x || x >= t.x + t.w || y < t.y || y >= t.y + t.h) continue;
                 var worth = t.value > 0 ? "%s %s".printf (money (t.value, p.currency), p.currency) : "Watching";
+                if (t.kind == TileKind.BENCHMARK) worth = "%s %s".printf (money (t.price, t.currency), t.currency);
                 tip.set_text ("%s · %s\n%s · %s over %s".printf (t.symbol, t.name, worth, pct (t.change), RANGE_LABELS[range]));
                 tip.set_tip_area ({ (int) t.x, (int) t.y, (int) t.w, (int) t.h });
                 return true;
@@ -38,13 +39,26 @@ public class Treemap : Gtk.DrawingArea {
     void paint (Gtk.DrawingArea area, Cairo.Context cr, int width, int height) {
         tiles = p.tiles (range, now_s (), width, height);
         bool any_held = false;
-        for (int i = 0; i < tiles.length; i++) any_held |= tiles[i].value > 0;
+        for (int i = 0; i < tiles.length; i++) any_held |= tiles[i].kind == TileKind.STOCK && tiles[i].value > 0;
         for (int i = 0; i < tiles.length; i++) {
             var t = tiles[i];
+            var symbol = Markup.escape_text (t.symbol), name = Markup.escape_text (t.name);
+            if (t.kind == TileKind.GROUP) {
+                // A folder: a dark band across the top of its region, named and carrying its average move.
+                double head = double.min (Portfolio.GROUP_HEADER, t.h / 3);
+                cr.set_source_rgb (0.13, 0.14, 0.17);
+                cr.rectangle (t.x + 1, t.y + 1, t.w - 2, head - 1);
+                cr.fill ();
+                cr.set_source_rgb (1, 1, 1);
+                string[] labels = { "<b>%s</b>   %s".printf (symbol, pct (t.change)), "<b>%s</b>".printf (symbol) };
+                foreach (var markup in labels)
+                    if (draw_text (this, cr, "<span font_desc='9'>%s</span>".printf (markup), t.x + 8, t.y + head / 2, 0, 0.5, t.w - 14, head)) break;
+                continue;
+            }
             heat (cr, t.change, range);
             cr.rectangle (t.x + 1, t.y + 1, t.w - 2, t.h - 2);
             cr.fill ();
-            if (any_held && t.value <= 0) {
+            if (any_held && t.kind == TileKind.STOCK && t.value <= 0) {
                 // Watched next to real holdings: a dashed outline says this tile's size isn't money.
                 cr.set_source_rgba (1, 1, 1, 0.55);
                 cr.set_line_width (1.5);
@@ -54,11 +68,23 @@ public class Treemap : Gtk.DrawingArea {
                 cr.set_dash (null, 0);
             }
             // Text scales with the tile; show as much as fits.
-            double size = double.min (t.w / 8, t.h / 4).clamp (7, 26);
-            var head = "<span font_desc='Bold %.0f'>%s</span>".printf (size, Markup.escape_text (t.symbol));
-            var move = "<span font_desc='%.0f'>%s</span>".printf (size * 0.75, pct (t.change));
-            var name = "<span font_desc='%.0f' alpha='75%%'>%s</span>".printf (size * 0.5 + 3, Markup.escape_text (t.name));
-            string[] fits = { @"$head\n$move\n$name", @"$head\n$move", head };
+            string[] fits;
+            if (t.kind == TileKind.BENCHMARK) {
+                // An index or a currency pair is known by its name and its level, not by Yahoo's ticker for it.
+                double size = double.min (t.w / 11, t.h / 3.6).clamp (7, 15);
+                var level = "<span font_desc='%.0f'>%s   %s</span>".printf (size * 0.85, money (t.price, t.currency), pct (t.change));
+                fits = {
+                    "<span font_desc='Bold %.0f'>%s</span>\n%s".printf (size, name, level),
+                    "<span font_desc='Bold %.0f'>%s</span>\n%s".printf (size, symbol, level),
+                    "<span font_desc='Bold %.0f'>%s</span>\n<span font_desc='%.0f'>%s</span>".printf (size, symbol, size * 0.85, pct (t.change)),
+                    "<span font_desc='Bold %.0f'>%s</span>".printf (size, symbol)
+                };
+            } else {
+                double size = double.min (t.w / 8, t.h / 4).clamp (7, 26);
+                var head = "<span font_desc='Bold %.0f'>%s</span>".printf (size, symbol);
+                var move = "<span font_desc='%.0f'>%s</span>".printf (size * 0.75, pct (t.change));
+                fits = { "%s\n%s\n<span font_desc='%.0f' alpha='75%%'>%s</span>".printf (head, move, size * 0.5 + 3, name), @"$head\n$move", head };
+            }
             cr.set_source_rgb (1, 1, 1);
             foreach (var markup in fits)
                 if (draw_text (this, cr, markup, t.x + t.w / 2, t.y + t.h / 2, 0.5, 0.5, t.w - 10, t.h - 6)) break;
@@ -75,16 +101,22 @@ public class Matrix : Gtk.DrawingArea {
         set_draw_func (paint);
     }
 
-    // Tracked symbols, biggest first (the treemap's tiles, layout ignored).
+    // Tracked symbols in heatmap order (its tiles, layout ignored, minus the folder headers).
+    GenericArray<Tile> rows () {
+        var all = p.tiles (Range.D1, now_s (), 1, 1), symbols = new GenericArray<Tile> ();
+        for (int i = 0; i < all.length; i++) if (all[i].kind != TileKind.GROUP) symbols.add (all[i]);
+        return symbols;
+    }
+
     public void refresh () {
-        content_height = ROW * (p.tiles (Range.D1, now_s (), 1, 1).length + 2);
+        content_height = ROW * (rows ().length + 2);
         queue_draw ();
     }
 
     void paint (Gtk.DrawingArea area, Cairo.Context cr, int width, int height) {
         var fg = get_color ();
         var now = now_s ();
-        var tiles = p.tiles (Range.D1, now, 1, 1);
+        var tiles = rows ();
         double label_w = double.min (width * 0.34, 320), cell_w = (width - label_w) / RANGE_LABELS.length;
 
         cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.6);

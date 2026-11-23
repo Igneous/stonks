@@ -38,6 +38,8 @@ public class Window : Adw.ApplicationWindow {
     Gtk.SingleSelection selection;
     Treemap treemap;
     Matrix matrix;
+    Gtk.ListBox folders = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" } };
+    string folders_shown = "";   // what the sidebar was last built from, see show_folders()
 
     public Window (Adw.Application app) {
         Object (application: app, title: "Stonks", default_width: 1240, default_height: 820);
@@ -97,10 +99,27 @@ public class Window : Adw.ApplicationWindow {
         stocks.append (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
         stocks.append (new Gtk.ScrolledWindow () { child = view, vexpand = true });
 
+        // Heatmap page: the treemap, and a sidebar of folders that the header's toggle shows and hides.
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
+        var side = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
+        side.append (new Gtk.CenterBox () {
+            start_widget = new Gtk.Label ("Folders") { css_classes = { "heading" } },
+            end_widget = new Gtk.Button.from_icon_name ("folder-new-symbolic") { action_name = "win.new-folder", tooltip_text = "New folder", css_classes = { "flat" } }
+        });
+        side.append (new Gtk.Label ("Sort stocks into sectors of your own. The heatmap draws each folder as one block.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
+        side.append (folders);
+        var split = new Adw.OverlaySplitView () {
+            sidebar = new Gtk.ScrolledWindow () { child = side, hscrollbar_policy = Gtk.PolicyType.NEVER },
+            content = treemap, min_sidebar_width = 260, max_sidebar_width = 340
+        };
+        var toggle = new Gtk.ToggleButton () { icon_name = "sidebar-show-symbolic", tooltip_text = "Folders", active = true, visible = false };
+        toggle.bind_property ("active", split, "show-sidebar", BindingFlags.BIDIRECTIONAL | BindingFlags.SYNC_CREATE);
+        header.pack_start (toggle);
+        pages.notify["visible-child-name"].connect (() => { toggle.visible = pages.visible_child_name == "heatmap"; });
+
         matrix = new Matrix (p) { margin_start = 12, margin_end = 12, margin_bottom = 12, valign = Gtk.Align.START };
         pages.add_titled_with_icon (stocks, "stocks", "Stocks", "view-list-symbolic");
-        pages.add_titled_with_icon (treemap, "heatmap", "Heatmap", "view-grid-symbolic");
+        pages.add_titled_with_icon (split, "heatmap", "Heatmap", "view-grid-symbolic");
         pages.add_titled_with_icon (new Gtk.ScrolledWindow () { child = matrix }, "performance", "Performance", "power-profile-performance-symbolic");
 
         var empty = new Adw.StatusPage () {
@@ -122,6 +141,30 @@ public class Window : Adw.ApplicationWindow {
         var refresh = new SimpleAction ("refresh", null);
         refresh.activate.connect (() => sync (true, true));
         add_action (refresh);
+
+        // Folder actions; the sidebar's menus carry the folder or stock they act on as the target.
+        var new_folder = new SimpleAction ("new-folder", null);
+        new_folder.activate.connect (() => folder_dialog (""));
+        add_action (new_folder);
+        var rename_folder = new SimpleAction ("rename-folder", VariantType.STRING);
+        rename_folder.activate.connect ((name) => folder_dialog (name.get_string ()));
+        add_action (rename_folder);
+        var delete_folder = new SimpleAction ("delete-folder", VariantType.STRING);
+        delete_folder.activate.connect ((name) => {
+            p.rename_group (name.get_string (), "");   // its stocks become ungrouped; nothing is removed
+            save ();
+            update ();
+        });
+        add_action (delete_folder);
+        var move = new SimpleAction ("move", new VariantType ("(ss)"));
+        move.activate.connect ((target) => {
+            string symbol, folder;
+            target.get ("(ss)", out symbol, out folder);
+            p.assign (symbol, folder);
+            save ();
+            update ();
+        });
+        add_action (move);
 
         // Dev aid, see the Makefile.
         var page = Environment.get_variable ("STONKS_VIEW");
@@ -280,6 +323,84 @@ public class Window : Adw.ApplicationWindow {
         treemap.range = range;
         treemap.queue_draw ();
         matrix.refresh ();
+        show_folders ();
+    }
+
+    // ---- heatmap folders ----
+
+    MenuItem menu_item (string label, string action, Variant target) {
+        var item = new MenuItem (label, null);
+        item.set_action_and_target_value (action, target);
+        return item;
+    }
+
+    // The sidebar: each folder with the stocks filed in it, then the unfiled. Only stocks the heatmap
+    // lays out in its body are listed; an index or currency pair sits in the top row whatever folder
+    // it might be given. Rebuilt only when the arrangement changes, so a price refresh doesn't fold up
+    // what is open.
+    void show_folders () {
+        var tiles = p.tiles (range, now_s (), 1, 1);
+        var shape = new StringBuilder ();
+        for (int i = 0; i < p.groups.length; i++) shape.append (p.groups[i] + "\n");
+        for (int i = 0; i < tiles.length; i++)
+            if (tiles[i].kind == TileKind.STOCK) shape.append ("%s\t%s\t%s\n".printf (tiles[i].symbol, tiles[i].group, tiles[i].name));
+        if (shape.str == folders_shown) return;
+        folders_shown = shape.str;
+        folders.remove_all ();
+
+        string[] names = {};
+        for (int i = 0; i < p.groups.length; i++) names += p.groups[i];
+        names += "";   // the unfiled, last
+        foreach (var name in names) {
+            var folder = new Adw.ExpanderRow () { use_markup = false, title = name != "" ? name : "Ungrouped", expanded = true };
+            folder.add_prefix (new Gtk.Image.from_icon_name ("folder-symbolic"));
+            if (name != "") {
+                var actions = new Menu ();
+                actions.append_item (menu_item ("Rename…", "win.rename-folder", new Variant.string (name)));
+                actions.append_item (menu_item ("Delete", "win.delete-folder", new Variant.string (name)));
+                folder.add_suffix (new Gtk.MenuButton () { icon_name = "view-more-symbolic", valign = Gtk.Align.CENTER, css_classes = { "flat" }, menu_model = actions });
+            }
+            int count = 0;
+            for (int i = 0; i < tiles.length; i++) {
+                var t = tiles[i];
+                if (t.kind != TileKind.STOCK || t.group != name) continue;
+                var targets = new Menu ();
+                for (int k = 0; k < p.groups.length; k++)
+                    if (p.groups[k] != name) targets.append_item (menu_item (p.groups[k], "win.move", new Variant ("(ss)", t.symbol, p.groups[k])));
+                if (name != "") targets.append_item (menu_item ("Ungrouped", "win.move", new Variant ("(ss)", t.symbol, "")));
+                var destinations = new Menu ();
+                destinations.append_section ("Move to", targets);
+                var row = new Adw.ActionRow () { use_markup = false, title = t.symbol, subtitle = t.name, subtitle_lines = 1 };
+                row.add_suffix (new Gtk.MenuButton () {
+                    icon_name = "folder-symbolic", tooltip_text = "Move to folder", valign = Gtk.Align.CENTER,
+                    css_classes = { "flat" }, menu_model = destinations, sensitive = targets.get_n_items () > 0
+                });
+                folder.add_row (row);
+                count++;
+            }
+            // Spelled out with ifs: valac 0.56 frees the inner result of a nested ?: over strings too early.
+            folder.subtitle = "Empty";
+            if (count == 1) folder.subtitle = "1 stock";
+            if (count > 1) folder.subtitle = @"$count stocks";
+            if (name != "" || count > 0) folders.append (folder);
+        }
+    }
+
+    // Name a new folder (old = "") or rename an existing one.
+    void folder_dialog (string old) {
+        var entry = new Gtk.Entry () { text = old, activates_default = true };
+        var dialog = new Adw.AlertDialog (old == "" ? "New folder" : "Rename folder", null) { extra_child = entry, default_response = "ok", close_response = "cancel" };
+        dialog.add_response ("cancel", "Cancel");
+        dialog.add_response ("ok", old == "" ? "Create" : "Rename");
+        dialog.set_response_appearance ("ok", Adw.ResponseAppearance.SUGGESTED);
+        dialog.response.connect ((id) => {
+            var name = entry.text.strip ();
+            if (id != "ok" || name == "" || p.groups.find_with_equal_func (name, str_equal)) return;   // also covers "unchanged"
+            if (old == "") p.groups.add (name); else p.rename_group (old, name);
+            save ();
+            update ();
+        });
+        dialog.present (this);
     }
 
     // ---- quotes ----
@@ -498,6 +619,7 @@ public class Window : Adw.ApplicationWindow {
         for (uint i = 0; i < p.lots.get_n_items (); i++) {
             var other = (Lot) p.lots.get_item (i);
             if (other.symbol != lot.symbol) continue;
+            lot.group = other.group;   // a symbol has one folder, whichever lot it came with
             if (lot.shares <= 0) {
                 toasts.add_toast (new Adw.Toast (@"$(lot.symbol) is already listed"));
                 return;
@@ -542,6 +664,14 @@ public class Window : Adw.ApplicationWindow {
             saved.get_array_member ("lots").foreach_element ((array, i, lot) => {
                 if (lot.get_node_type () == Json.NodeType.OBJECT) p.lots.append (Json.gobject_deserialize (typeof (Lot), lot));
             });
+            if (saved.has_member ("groups")) saved.get_array_member ("groups").foreach_element ((array, i, name) => {
+                if (name.get_node_type () == Json.NodeType.VALUE && name.get_string () != null) p.groups.add (name.get_string ());
+            });
+            // A folder some lot names but the list forgot (a hand-edited file) still exists.
+            for (uint i = 0; i < p.lots.get_n_items (); i++) {
+                var group = ((Lot) p.lots.get_item (i)).group;
+                if (group != "" && !p.groups.find_with_equal_func (group, str_equal)) p.groups.add (group);
+            }
         } catch (Error e) {
             // Move it aside so the next save can't overwrite a file we failed to read.
             FileUtils.rename (path, path + ".bad");
@@ -553,7 +683,10 @@ public class Window : Adw.ApplicationWindow {
         var lots = new Json.Array ();
         for (uint i = 0; i < p.lots.get_n_items (); i++) lots.add_element (Json.gobject_serialize (p.lots.get_item (i)));
         var saved = new Json.Object ();
+        var groups = new Json.Array ();
+        for (int i = 0; i < p.groups.length; i++) groups.add_string_element (p.groups[i]);
         saved.set_string_member ("currency", p.currency);
+        saved.set_array_member ("groups", groups);
         saved.set_array_member ("lots", lots);
         var node = new Json.Node (Json.NodeType.OBJECT);
         node.set_object (saved);

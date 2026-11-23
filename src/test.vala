@@ -135,5 +135,46 @@ void main () {
     near (tiles[0].w * tiles[0].h, tiles[1].w * tiles[1].h);
     assert (watch.history (Range.D7, NOW, out opening).n == 0);
 
+    // --- folders and the benchmark row ---
+    // p holds A (1635) and J (20) and watches W. File A and J under Tech; watch an index too.
+    p.groups.add ("Tech");
+    p.assign ("A", "Tech");
+    p.assign ("J", "Tech");
+    assert (((Lot) p.lots.get_item (1)).group == "Tech");      // both lots of A moved
+    var index = quote ("^X", "USD", 5000, 10);
+    index.kind = "INDEX";
+    p.quotes["^X"] = index;
+    p.lots.append (new Lot () { symbol = "^X" });
+    p.rebase ();
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    // the index in a row along the top; then Tech with A and J; then Ungrouped with W
+    string order = "";
+    for (int i = 0; i < tiles.length; i++) order += tiles[i].symbol + " ";
+    assert (order == "^X Tech A J Ungrouped W ");
+    assert (tiles[0].kind == TileKind.BENCHMARK && tiles[1].kind == TileKind.GROUP && tiles[2].kind == TileKind.STOCK);
+    near (tiles[0].w, 400);
+    near (tiles[0].h, Portfolio.BENCHMARK_ROW);
+    near (tiles[1].y, Portfolio.BENCHMARK_ROW);
+    double rest = 400 * (300 - Portfolio.BENCHMARK_ROW);
+    near (tiles[1].w * tiles[1].h, rest * 1655 / (1655 + 827.5));                 // a folder is as big as its stocks
+    near (tiles[1].change, (1635 * (109.0 / 108 - 1) + 20 * 0) / 1655);           // and moves as their weighted average
+    near (tiles[2].y, tiles[1].y + Portfolio.GROUP_HEADER);                       // stocks start below its label
+    near (tiles[2].w * tiles[2].h + tiles[3].w * tiles[3].h, tiles[1].w * (tiles[1].h - Portfolio.GROUP_HEADER));
+    p.gain (Range.MAX, NOW, out gain, out capital);
+    near (capital, 10 * 90 + 5 * 104 + 10);                                       // none of this touches the totals
+
+    // a held index fund is a position like any other: in the body, not the top row
+    ((Lot) p.lots.get_item (4)).shares = 1;
+    ((Lot) p.lots.get_item (4)).price = 5000;
+    p.rebase ();
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    assert (tiles[0].kind != TileKind.BENCHMARK);
+
+    // deleting a folder unfiles its stocks; with no folders the map is flat again
+    p.rename_group ("Tech", "");
+    assert (p.groups.length == 0 && ((Lot) p.lots.get_item (0)).group == "");
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    for (int i = 0; i < tiles.length; i++) assert (tiles[i].kind == TileKind.STOCK);
+
     print ("ok\n");
 }
