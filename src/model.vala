@@ -60,6 +60,31 @@ public class Series {
     public double at (int64 ts) { return n == 0 ? double.NAN : v[int.max (before (ts + 1), 0)]; }
 }
 
+// What a feed says about an instrument beyond its price history: the figures on a quote page.
+// NaN, or "", wherever it says nothing (an index has no P/E, a Hanoi stock has none of this).
+public class Stats {
+    public double open = double.NAN;
+    public double high = double.NAN;             // today's
+    public double low = double.NAN;
+    public double prev_close = double.NAN;
+    public double volume = double.NAN;
+    public double avg_volume = double.NAN;       // three months' daily average
+    public double cap = double.NAN;
+    public double pe = double.NAN;               // trailing
+    public double eps = double.NAN;
+    public double high52 = double.NAN;
+    public double low52 = double.NAN;
+    public double dividend_yield = double.NAN;   // percent a year
+    public double dividend_rate = double.NAN;    // per share a year
+    public double extra_price = double.NAN;      // outside regular hours...
+    public double extra_change = double.NAN;     // ...and its change from the close, in percent
+    public string extra = "";                    // ...and which: "After hours" or "Pre-market"
+    public string exchange = "";
+    public string state = "";                    // REGULAR while the market is open
+    public string zone = "";                     // the exchange's timezone, as it abbreviates it
+    public int64 time;                           // of the last regular trade
+}
+
 // One instrument as its feed quotes it. `daily` always has at least one bar.
 public class Quote {
     public string symbol = "";
@@ -71,6 +96,7 @@ public class Quote {
     public double prev_close = double.NAN;   // previous session's close when the feed states one; NaN = derive it from daily
     public Series daily = new Series ();     // full history, 1d bars; the last bar is the live session
     public Series intra = new Series ();     // last 7 days, 5m bars
+    public Stats stats = new Stats ();       // empty until the feed has been asked (see Feed.load_stats)
     public int64 opens;                      // the regular session the feed last reported, unix time (0 = unknown)
     public int64 closes;
     public int64 refreshed;                  // when we last asked the feed about it
@@ -121,6 +147,16 @@ public class Quote {
         var s = new Series ();
         for (int i = src.before (from) + 1; i < src.n; i++) s.add (src.t[i], src.v[i]);
         return s;
+    }
+
+    // The lowest and highest close since `from`, out of a series: what stands in for a day's range or
+    // a 52-week range when the feed gives none. NaN if there is nothing that recent.
+    public static void extremes (Series s, int64 from, out double lowest, out double highest) {
+        lowest = highest = double.NAN;
+        for (int i = s.before (from) + 1; i < s.n; i++) {
+            lowest = lowest.is_finite () ? double.min (lowest, s.v[i]) : s.v[i];
+            highest = highest.is_finite () ? double.max (highest, s.v[i]) : s.v[i];
+        }
     }
 
     // Index of the daily bar for the day starting at `day`, or the nearest earlier one (weekends, holidays).
@@ -216,6 +252,18 @@ public class Portfolio {
     public bool tracks (string symbol) {
         for (uint i = 0; i < lots.get_n_items (); i++) if (((Lot) lots.get_item (i)).symbol == symbol) return true;
         return false;
+    }
+
+    // Whether a symbol sits in the heatmap's top row rather than its body: something other than a
+    // company's stock (an index, a fund, a pair) that is watched and not held.
+    public bool is_benchmark (string symbol) {
+        var q = quotes[symbol];
+        if (q == null || q.is_stock) return false;
+        for (uint i = 0; i < lots.get_n_items (); i++) {
+            var l = (Lot) lots.get_item (i);
+            if (l.symbol == symbol && l.shares > 0) return false;
+        }
+        return true;
     }
 
     // File a symbol (every lot of it) in a folder; "" takes it out.

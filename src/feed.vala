@@ -182,6 +182,11 @@ public class Feed {
         return q.intra.n > 0 && q.intra.t[q.intra.n - 1] > week ? q.intra.t[q.intra.n - 1] - 1800 : week;
     }
 
+    // A US security's full name ("Alphabet Inc. - Class C Capital Stock") if we know it, else null.
+    public string? full_name (string symbol) {
+        return names != null ? names[symbol] : null;
+    }
+
     // Full names of US-listed securities, from Nasdaq Trader's symbol directory. Yahoo calls every share
     // class of a company the same thing ("Alphabet Inc." for GOOG, GOOGL, GOOGM and GOOGN alike); these
     // say which is which. Two small files, downloaded once a week and kept in the cache.
@@ -429,6 +434,53 @@ public class Feed {
         if (symbols.length == 0) return null;
         var root = yield authed (@"$YAHOO/v7/finance/quote?fields=$fields&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
         return root != null && root.has_member ("quoteResponse") ? root.get_object_member ("quoteResponse").get_array_member ("result") : null;
+    }
+
+    // Fill in the statistics of several quotes at once (day's range, market cap, P/E, dividend, trading
+    // outside hours...): one request, whatever their number. Quotes Yahoo doesn't know keep what they had.
+    public async void load_stats (GenericArray<Quote> quotes) {
+        string[] symbols = {};
+        for (int i = 0; i < quotes.length; i++) {
+            // Not Vietnam's indices: Yahoo answers for them, but out of a single day of history (a
+            // "52-week range" a few points wide). Better none, and the ranges worked out from SSI's bars.
+            if (!(quotes[i].symbol.has_prefix ("^") && from_ssi (quotes[i].symbol))) symbols += quotes[i].symbol;
+        }
+        var answers = yield quote_batch (symbols, "regularMarketOpen,regularMarketDayHigh,regularMarketDayLow,regularMarketPreviousClose,regularMarketVolume,averageDailyVolume3Month,marketCap,trailingPE,epsTrailingTwelveMonths,fiftyTwoWeekHigh,fiftyTwoWeekLow,dividendYield,dividendRate,trailingAnnualDividendRate,postMarketPrice,postMarketChangePercent,preMarketPrice,preMarketChangePercent,regularMarketTime,marketState,exchangeTimezoneShortName,fullExchangeName");
+        for (uint i = 0; answers != null && i < answers.get_length (); i++) {
+            var o = answers.get_object_element (i);
+            for (int k = 0; k < quotes.length; k++) {
+                if (quotes[k].symbol != o.get_string_member_with_default ("symbol", "")) continue;
+                var s = new Stats ();
+                s.open = o.get_double_member_with_default ("regularMarketOpen", double.NAN);
+                if (s.open <= 0) s.open = double.NAN;   // Yahoo sends 0 for "not yet"
+                s.high = o.get_double_member_with_default ("regularMarketDayHigh", double.NAN);
+                s.low = o.get_double_member_with_default ("regularMarketDayLow", double.NAN);
+                s.prev_close = o.get_double_member_with_default ("regularMarketPreviousClose", double.NAN);
+                s.volume = o.get_double_member_with_default ("regularMarketVolume", double.NAN);
+                s.avg_volume = o.get_double_member_with_default ("averageDailyVolume3Month", double.NAN);
+                s.cap = o.get_double_member_with_default ("marketCap", double.NAN);
+                s.pe = o.get_double_member_with_default ("trailingPE", double.NAN);
+                s.eps = o.get_double_member_with_default ("epsTrailingTwelveMonths", double.NAN);
+                s.high52 = o.get_double_member_with_default ("fiftyTwoWeekHigh", double.NAN);
+                s.low52 = o.get_double_member_with_default ("fiftyTwoWeekLow", double.NAN);
+                s.dividend_yield = o.get_double_member_with_default ("dividendYield", double.NAN);
+                s.dividend_rate = o.get_double_member_with_default ("dividendRate", o.get_double_member_with_default ("trailingAnnualDividendRate", double.NAN));
+                s.state = o.get_string_member_with_default ("marketState", "");
+                s.zone = o.get_string_member_with_default ("exchangeTimezoneShortName", "");
+                s.exchange = o.get_string_member_with_default ("fullExchangeName", "");
+                s.time = o.get_int_member_with_default ("regularMarketTime", 0);
+                if (s.state.has_prefix ("PRE") && o.has_member ("preMarketPrice")) {
+                    s.extra = "Pre-market";
+                    s.extra_price = o.get_double_member ("preMarketPrice");
+                    s.extra_change = o.get_double_member_with_default ("preMarketChangePercent", double.NAN);
+                } else if (s.state != "REGULAR" && o.has_member ("postMarketPrice")) {
+                    s.extra = "After hours";
+                    s.extra_price = o.get_double_member ("postMarketPrice");
+                    s.extra_change = o.get_double_member_with_default ("postMarketChangePercent", double.NAN);
+                }
+                quotes[k].stats = s;
+            }
+        }
     }
 
     // ---- Logos ----

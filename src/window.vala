@@ -1,4 +1,5 @@
-// The window: the table of tracked stocks and its chart, the two heatmap pages, and the add-stock dialog.
+// The window: a sidebar of everything tracked; the Stocks page (the portfolio, or one stock's quote card);
+// the two heatmap pages; and the add-stock dialog.
 namespace Stonks {
 
 const string APP_ID = "io.github.igneous.Stonks";
@@ -7,6 +8,15 @@ const string[] COLUMNS = { "Symbol", "Name", "Shares", "Bought", "Cost", "Price"
 const int COL_CHANGE = 7;
 const int COL_VALUE = 8;
 const int COL_GAIN = 9;
+// The figures of a quote card, in the order Window.facts_of() gives them: three to a column.
+const string[] FACTS = { "Open", "High", "Low", "Prev close", "Volume", "Avg volume", "Mkt cap", "P/E ratio", "EPS", "52-wk high", "52-wk low", "Dividend" };
+// "-7.02 today": what the change is over, for each range.
+const string[] SPANS = { "today", "past 7 days", "past 30 days", "year to date", "past year", "past 5 years", "all time" };
+
+// GTK's own call for a display-wide stylesheet. Bound here because Vala files it under Gtk.StyleContext,
+// a class deprecated as a whole although this function is not.
+[CCode (cname = "gtk_style_context_add_provider_for_display")]
+extern void add_style_provider (Gdk.Display display, Gtk.StyleProvider provider, uint priority);
 
 public class Window : Adw.ApplicationWindow {
     Portfolio p = new Portfolio ();
@@ -30,12 +40,32 @@ public class Window : Adw.ApplicationWindow {
     Gtk.Label cost_lbl;
     Gtk.Label chart_title = new Gtk.Label ("") { css_classes = { "heading" }, ellipsize = Pango.EllipsizeMode.END };
     Gtk.Label chart_change = new Gtk.Label ("") { css_classes = { "numeric" } };
-    Gtk.Button back = new Gtk.Button.with_label ("Show portfolio") { css_classes = { "flat" }, hexpand = true, halign = Gtk.Align.END };
+    Gtk.Button back = new Gtk.Button.with_label ("Show portfolio") { css_classes = { "flat" }, valign = Gtk.Align.CENTER };
+    Adw.ViewStack pages = new Adw.ViewStack ();
+    Gtk.Box chart_head = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 12) { margin_start = 18, margin_end = 12, margin_top = 12, height_request = 34 };
+    // The quote card: what the Stocks page shows around the chart once a stock is selected.
+    Gtk.Box card = new Gtk.Box (Gtk.Orientation.VERTICAL, 6) { margin_start = 18, margin_end = 12, margin_top = 10, margin_bottom = 4 };
+    Gtk.Image card_logo = new Gtk.Image () { pixel_size = 48, valign = Gtk.Align.CENTER };
+    Gtk.Label card_name = new Gtk.Label ("") { xalign = 0, css_classes = { "title-2" }, ellipsize = Pango.EllipsizeMode.END };
+    Gtk.Label card_sub = new Gtk.Label ("") { xalign = 0, css_classes = { "dim-label" } };
+    Gtk.Label card_price = new Gtk.Label ("") { css_classes = { "title-1", "numeric" } };
+    Gtk.Label card_unit = new Gtk.Label ("") { css_classes = { "dim-label" }, valign = Gtk.Align.END, margin_bottom = 4 };
+    Gtk.Label card_chip = new Gtk.Label ("") { css_classes = { "chip", "numeric" }, valign = Gtk.Align.CENTER };
+    Gtk.Label card_moved = new Gtk.Label ("") { css_classes = { "numeric" }, valign = Gtk.Align.CENTER };
+    Gtk.Label card_status = new Gtk.Label ("") { xalign = 0, css_classes = { "caption", "dim-label" } };
+    Gtk.Grid facts = new Gtk.Grid () { column_spacing = 14, row_spacing = 6, margin_start = 18, margin_end = 18, margin_top = 2, margin_bottom = 12 };
+    Gtk.Label[] fact_values = {};
+    GenericSet<string> stats_asked = new GenericSet<string> (str_hash, str_equal);   // see fetch_stats()
+    int64 stats_fetched;
+    bool stats_busy;
     Chart chart = new Chart ();
     Gtk.ColumnView view = new Gtk.ColumnView (null) { css_classes = { "data-table" } };
     Gtk.ColumnViewColumn[] columns = {};
     GenericArray<Gtk.ColumnViewCell> cells = new GenericArray<Gtk.ColumnViewCell> ();
-    Gtk.SingleSelection selection;
+    string shown = "";            // the symbol whose quote card the Stocks page shows; "" for the portfolio
+    string sought = "";           // what the sidebar's search field holds, lower-cased
+    Gtk.CustomFilter held_lots;   // what the positions table lists, see the constructor
+    Gtk.ScrolledWindow positions = new Gtk.ScrolledWindow () { propagate_natural_height = true, max_content_height = 264 };
     Treemap treemap;
     Matrix matrix;
     // Logos, by symbol: looked up once each (see want_logo) and then kept in the cache for good.
@@ -59,8 +89,12 @@ public class Window : Adw.ApplicationWindow {
             }
         }
 
+        // The styling of our own: the coloured pill a change sits in, and the sidebar row that is open.
+        var css = new Gtk.CssProvider ();
+        css.load_from_string (".chip { border-radius: 8px; padding: 2px 10px; font-weight: bold; } .chip.success { background: alpha(@success_color, 0.15); } .chip.error { background: alpha(@error_color, 0.15); } row.picked { background: alpha(@accent_bg_color, 0.2); }");
+        add_style_provider (display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+
         // Header bar: add, page switcher, totals currency, refresh.
-        var pages = new Adw.ViewStack ();
         var header = new Adw.HeaderBar () { title_widget = new Adw.ViewSwitcher () { stack = pages, policy = Adw.ViewSwitcherPolicy.WIDE } };
         header.pack_start (new Gtk.Button.from_icon_name ("list-add-symbolic") { action_name = "win.add", tooltip_text = "Add stock (Ctrl+N)" });
         var menu = new Menu ();
@@ -90,11 +124,33 @@ public class Window : Adw.ApplicationWindow {
         day_lbl = stat (stats, "Day");
         total_lbl = stat (stats, "Total gain");
         cost_lbl = stat (stats, "Cost basis");
-        var chart_head = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 12) { margin_start = 18, margin_end = 12, margin_top = 12, height_request = 34 };
         chart_head.append (chart_title);
         chart_head.append (chart_change);
-        chart_head.append (back);
-        back.clicked.connect (() => { selection.selected = Gtk.INVALID_LIST_POSITION; });
+        back.clicked.connect (() => show_stock (""));
+
+        // The quote card: logo, name and exchange; price and change; when that was. Then, under the
+        // chart, the figures.
+        var naming = new Gtk.Box (Gtk.Orientation.VERTICAL, 2) { hexpand = true, valign = Gtk.Align.CENTER };
+        naming.append (card_name);
+        naming.append (card_sub);
+        var card_head = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 12);
+        card_head.append (card_logo);
+        card_head.append (naming);
+        card_head.append (back);
+        var pricing = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 10);
+        pricing.append (card_price);
+        pricing.append (card_unit);
+        pricing.append (card_chip);
+        pricing.append (card_moved);
+        card.append (card_head);
+        card.append (pricing);
+        card.append (card_status);
+        for (int i = 0; i < FACTS.length; i++) {
+            var value = new Gtk.Label ("—") { xalign = 0, hexpand = true, css_classes = { "numeric" } };
+            facts.attach (new Gtk.Label (FACTS[i]) { xalign = 0, css_classes = { "dim-label" } }, i / 3 * 2, i % 3);
+            facts.attach (value, i / 3 * 2 + 1, i % 3);
+            fact_values += value;
+        }
 
         for (int i = 0; i < COLUMNS.length; i++) add_column (i);
         var bin = new Gtk.SignalListItemFactory ();
@@ -105,41 +161,59 @@ public class Window : Adw.ApplicationWindow {
             cell.child = button;
         });
         view.append_column (new Gtk.ColumnViewColumn (null, bin));
-        selection = new Gtk.SingleSelection (new Gtk.SortListModel (p.lots, view.sorter)) { autoselect = false, can_unselect = true };
-        selection.selected = Gtk.INVALID_LIST_POSITION;
-        selection.notify["selected-item"].connect (() => update ());   // a selected row charts that symbol
-        view.model = selection;
+        // The table lists positions: the lots actually held. All of them under the portfolio, the shown
+        // stock's own under its card; a click on one opens that stock.
+        held_lots = new Gtk.CustomFilter ((o) => ((Lot) o).shares > 0 && (shown == "" || ((Lot) o).symbol == shown));
+        var listed = new Gtk.SortListModel (new Gtk.FilterListModel (p.lots, held_lots), view.sorter);
+        view.model = new Gtk.NoSelection (listed);
+        view.single_click_activate = true;
+        view.activate.connect ((at) => show_stock (((Lot) listed.get_item (at)).symbol));
+        positions.child = view;
 
+        // The Stocks page, top to bottom: the portfolio's totals or a stock's card; the chart, which
+        // takes whatever height is left; the stock's figures; the positions.
+        chart.vexpand = true;
         var stocks = new Gtk.Box (Gtk.Orientation.VERTICAL, 0);
         stocks.append (stats);
         stocks.append (chart_head);
+        stocks.append (card);
         stocks.append (chart);
-        stocks.append (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
-        stocks.append (new Gtk.ScrolledWindow () { child = view, vexpand = true });
+        stocks.append (facts);
+        stocks.append (positions);
 
-        // Heatmap page: the treemap, and a sidebar of folders that the header's toggle shows and hides.
+        // Heatmap page: the treemap. Then the sidebar, which all the pages share: everything tracked, in
+        // its folders, searchable; the header's toggle shows and hides it.
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         treemap.charts = tile_charts;
         treemap.dropped.connect ((payload, folder, target, after) => dropped (payload, folder, target, after));
+        treemap.peeked.connect ((symbol) => { treemap.card.child = hover_card (symbol); });
+        treemap.opened.connect ((symbol) => show_stock (symbol));   // double-clicked
         var side = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         side.append (new Gtk.CenterBox () {
             start_widget = new Gtk.Label ("Folders") { css_classes = { "heading" } },
             end_widget = new Gtk.Button.from_icon_name ("folder-new-symbolic") { action_name = "win.new-folder", tooltip_text = "New folder", css_classes = { "flat" } }
         });
-        side.append (new Gtk.Label ("Arrange by dragging, here or on the heatmap: a stock onto a folder to file it, onto another stock to put it beside that one. Folders can be dragged into order too.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
+        var search = new Gtk.SearchEntry () { placeholder_text = "Find a stock" };
+        search.search_changed.connect (() => {
+            sought = search.text.strip ().down ();
+            show_folders ();
+        });
+        side.append (search);
+        side.append (new Gtk.Label ("Click to open. Drag to arrange, here or on the heatmap: onto a folder to file a stock, onto another stock to put it beside that one.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
         side.append (folders);
+        // A plain list doesn't pass a click on to its rows; the folders' own lists do.
+        folders.row_activated.connect ((row) => { if (row is Adw.ActionRow) ((Adw.ActionRow) row).activate (); });
         var split = new Adw.OverlaySplitView () {
             sidebar = new Gtk.ScrolledWindow () { child = side, hscrollbar_policy = Gtk.PolicyType.NEVER },
-            content = treemap, min_sidebar_width = 260, max_sidebar_width = 340
+            content = pages, min_sidebar_width = 260, max_sidebar_width = 340
         };
-        var toggle = new Gtk.ToggleButton () { icon_name = "sidebar-show-symbolic", tooltip_text = "Folders", active = true, visible = false };
+        var toggle = new Gtk.ToggleButton () { icon_name = "sidebar-show-symbolic", tooltip_text = "Sidebar", active = true };
         toggle.bind_property ("active", split, "show-sidebar", BindingFlags.BIDIRECTIONAL | BindingFlags.SYNC_CREATE);
         header.pack_start (toggle);
-        pages.notify["visible-child-name"].connect (() => { toggle.visible = pages.visible_child_name == "heatmap"; });
 
         matrix = new Matrix (p) { margin_start = 12, margin_end = 12, margin_bottom = 12, valign = Gtk.Align.START };
         pages.add_titled_with_icon (stocks, "stocks", "Stocks", "view-list-symbolic");
-        pages.add_titled_with_icon (split, "heatmap", "Heatmap", "view-grid-symbolic");
+        pages.add_titled_with_icon (treemap, "heatmap", "Heatmap", "view-grid-symbolic");
         pages.add_titled_with_icon (new Gtk.ScrolledWindow () { child = matrix }, "performance", "Performance", "power-profile-performance-symbolic");
 
         var empty = new Adw.StatusPage () {
@@ -148,7 +222,7 @@ public class Window : Adw.ApplicationWindow {
             child = new Gtk.Button.with_label ("Add stock") { action_name = "win.add", halign = Gtk.Align.CENTER, css_classes = { "pill", "suggested-action" } }
         };
         stack.add_named (empty, "empty");
-        stack.add_named (pages, "main");
+        stack.add_named (split, "main");
         var toolbar = new Adw.ToolbarView () { content = stack };
         toolbar.add_top_bar (header);
         toolbar.add_top_bar (bar);
@@ -159,7 +233,11 @@ public class Window : Adw.ApplicationWindow {
         add.activate.connect (() => add_dialog (null));
         add_action (add);
         var refresh = new SimpleAction ("refresh", null);
-        refresh.activate.connect (() => sync (true, true));
+        refresh.activate.connect (() => {
+            stats_fetched = 0;
+            sync (true, true);
+            fetch_stats.begin ();
+        });
         add_action (refresh);
 
         // The main menu.
@@ -201,6 +279,9 @@ public class Window : Adw.ApplicationWindow {
         var add_to = new SimpleAction ("add-to", VariantType.STRING);
         add_to.activate.connect ((name) => add_dialog (new Lot () { group = name.get_string () }));
         add_action (add_to);
+        var remove = new SimpleAction ("remove", VariantType.STRING);
+        remove.activate.connect ((symbol) => remove_symbol (symbol.get_string ()));
+        add_action (remove);
         var move = new SimpleAction ("move", new VariantType ("(ss)"));
         move.activate.connect ((target) => {
             string symbol, folder;
@@ -215,7 +296,7 @@ public class Window : Adw.ApplicationWindow {
         var r = Environment.get_variable ("STONKS_RANGE");
         if (r != null) ranges.active = int.parse (r);
         var row = Environment.get_variable ("STONKS_ROW");
-        if (row != null) selection.selected = int.parse (row);
+        if (row != null && int.parse (row) < p.lots.get_n_items ()) shown = ((Lot) p.lots.get_item (int.parse (row))).symbol;
 
         update ();
         sync (true);
@@ -256,7 +337,8 @@ public class Window : Adw.ApplicationWindow {
         var factory = new Gtk.SignalListItemFactory ();
         factory.setup.connect ((o) => {
             var cell = (Gtk.ColumnViewCell) o;
-            cell.child = new Gtk.Label (null) { xalign = text_column ? 0 : 1, ellipsize = Pango.EllipsizeMode.END, css_classes = { "numeric" } };
+            // Only the name gives way when the table is narrow: a cut-off date or gain is no use.
+            cell.child = new Gtk.Label (null) { xalign = text_column ? 0 : 1, ellipsize = col == 1 ? Pango.EllipsizeMode.END : Pango.EllipsizeMode.NONE, css_classes = { "numeric" } };
             cell.set_data<int> ("col", col);
             cells.add (cell);
         });
@@ -328,9 +410,10 @@ public class Window : Adw.ApplicationWindow {
         // With nothing held there is no portfolio to total or chart: hide the totals and chart a stock.
         bool held = false;
         for (uint i = 0; i < p.lots.get_n_items (); i++) held |= ((Lot) p.lots.get_item (i)).shares > 0;
-        stats.visible = held;
-        foreach (int col in new int[] { 2, 3, 4, COL_VALUE, COL_GAIN, COL_GAIN + 1 }) columns[col].visible = held;   // the position columns
-        if (!held && selection.selected_item == null && selection.get_n_items () > 0) selection.selected = 0;
+        if (shown != "" && !p.tracks (shown)) shown = "";   // it was removed
+        if (shown == "" && !held && p.lots.get_n_items () > 0) shown = ((Lot) p.lots.get_item (0)).symbol;
+        held_lots.changed (Gtk.FilterChange.DIFFERENT);
+        positions.visible = view.model.get_n_items () > 0;
 
         double day, day_capital, total, cost, moved, moved_capital;
         p.gain (Range.D1, now, out day, out day_capital);
@@ -341,14 +424,13 @@ public class Window : Adw.ApplicationWindow {
         show_gain (total_lbl, total, cost, p.currency);
         cost_lbl.label = money (cost, p.currency);
 
-        var lot = selection.selected_item as Lot;
-        var q = lot != null ? p.quotes[lot.symbol] : null;
-        back.visible = lot != null && held;
+        // The shown stock gets its quote card around the chart; otherwise it is the portfolio's totals.
+        var q = shown != "" ? p.quotes[shown] : null;
+        card.visible = facts.visible = q != null;
+        chart_head.visible = stats.visible = q == null && held;
+        back.visible = held;
         if (q != null) {
-            double basis = q.basis (range, now);
-            chart_title.label = "%s · %s · %s %s".printf (q.symbol, q.name, money (q.price, q.currency), q.currency);
-            show_gain (chart_change, q.price - basis, basis, q.currency);
-            chart.plot (q.view (range, now), basis, q.price >= basis, range, q.currency);
+            show_card (q, now);
         } else {
             double opening;
             var history = p.history (range, now, out opening);
@@ -368,6 +450,146 @@ public class Window : Adw.ApplicationWindow {
         treemap.queue_draw ();
         matrix.refresh ();
         show_folders ();
+    }
+
+    // ---- the quote card ----
+
+    // Open a stock's quote card on the Stocks page, or the portfolio with "".
+    void show_stock (string symbol) {
+        shown = symbol;
+        pages.visible_child_name = "stocks";
+        update ();
+    }
+
+    // Fill the quote card and the figures under the chart for the selected stock, Google Finance style.
+    void show_card (Quote q, int64 now) {
+        double basis = q.basis (range, now), moved = q.price - basis;
+        var s = q.stats;
+        var texture = logos[q.symbol];
+        card_logo.visible = texture != null;
+        if (texture != null) card_logo.paintable = texture;
+        card_name.label = feed.full_name (q.symbol) ?? q.name;
+        card_sub.label = s.exchange != "" ? @"$(s.exchange): $(q.symbol)" : q.symbol;
+        card_price.label = q.price < 1 ? "%.4g".printf (q.price) : money (q.price, q.currency);
+        card_unit.label = q.currency;
+        card_chip.label = "%s %.2f%%".printf (moved >= 0 ? "▲" : "▼", Math.fabs (moved / basis) * 100);
+        tint (card_chip, moved);
+        card_moved.label = "%s %s".printf (delta (moved, q.currency), SPANS[range]);
+        tint (card_moved, moved);
+        string[] when = {};
+        if (s.time > 0) {
+            var at = new DateTime.from_unix_utc (s.time + q.gmtoffset).format ("%b %e, %H:%M");   // on the exchange's clock
+            when += "%s: %s %s".printf (s.state == "REGULAR" ? "Market open" : "Closed", at, s.zone);
+        }
+        if (s.extra != "") when += "%s %s %s".printf (s.extra, money (s.extra_price, q.currency), pct (s.extra_change / 100));
+        card_status.label = string.joinv ("  ·  ", when);
+        card_status.visible = when.length > 0;
+        chart.plot (q.view (range, now), basis, moved >= 0, range, q.currency);
+        var values = facts_of (q, now);
+        for (int i = 0; i < FACTS.length; i++) fact_values[i].label = values[i];
+    }
+
+    // The figures of a quote, in FACTS' order. Where the feed has none (a Hanoi stock has no Yahoo
+    // quote) the day's range, the previous close and the year's range are worked out from the closes
+    // we hold, so those are close-to-close rather than the true highs and lows.
+    string[] facts_of (Quote q, int64 now) {
+        var s = q.stats;
+        var cur = q.currency;
+        double day_low, day_high, year_low, year_high;
+        Quote.extremes (q.intra.n > 0 ? q.intra : q.daily, q.start (Range.D1, now), out day_low, out day_high);
+        Quote.extremes (q.daily, now - 365 * 86400, out year_low, out year_high);
+        string dividend = "—";
+        if (s.dividend_yield > 0) dividend = "%.2f%%".printf (s.dividend_yield);
+        if (s.dividend_yield > 0 && s.dividend_rate > 0) dividend += " (%s a year)".printf (money (s.dividend_rate, cur));
+        string volume = "—", average = "—", cap = "—", pe = "—";
+        if (s.volume.is_finite ()) volume = compact (s.volume);
+        if (s.avg_volume.is_finite ()) average = compact (s.avg_volume);
+        if (s.cap.is_finite ()) cap = compact (s.cap) + " " + cur;
+        if (s.pe.is_finite ()) pe = "%.2f".printf (s.pe);
+        return {
+            money (s.open, cur),
+            money (s.high.is_finite () ? s.high : day_high, cur),
+            money (s.low.is_finite () ? s.low : day_low, cur),
+            money (s.prev_close.is_finite () ? s.prev_close : q.basis (Range.D1, now), cur),
+            volume, average, cap, pe,
+            money (s.eps, cur),
+            money (s.high52.is_finite () ? s.high52 : year_high, cur),
+            money (s.low52.is_finite () ? s.low52 : year_low, cur),
+            dividend
+        };
+    }
+
+    // The heatmap's hover card: the quote card in miniature, plus what is held of it.
+    Gtk.Widget? hover_card (string symbol) {
+        var q = p.quotes[symbol];
+        if (q == null) return null;
+        var now = now_s ();
+        double basis = q.basis (range, now), moved = q.price - basis;
+        var box = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 8, margin_end = 8, margin_top = 8, margin_bottom = 8, width_request = 340 };
+
+        var naming = new Gtk.Box (Gtk.Orientation.VERTICAL, 0) { valign = Gtk.Align.CENTER };
+        naming.append (new Gtk.Label (feed.full_name (symbol) ?? q.name) { xalign = 0, wrap = true, max_width_chars = 34, css_classes = { "heading" } });
+        naming.append (new Gtk.Label (q.stats.exchange != "" ? @"$(q.stats.exchange): $symbol" : symbol) { xalign = 0, css_classes = { "caption", "dim-label" } });
+        var head = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 10);
+        if (logos.contains (symbol)) head.append (new Gtk.Image.from_paintable (logos[symbol]) { pixel_size = 32 });
+        head.append (naming);
+        box.append (head);
+
+        var chip = new Gtk.Label ("%s %.2f%%".printf (moved >= 0 ? "▲" : "▼", Math.fabs (moved / basis) * 100)) { css_classes = { "chip", "numeric" }, valign = Gtk.Align.CENTER };
+        tint (chip, moved);
+        var pricing = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 8);
+        pricing.append (new Gtk.Label (price_text (q.price, q.currency)) { css_classes = { "title-3", "numeric" } });
+        pricing.append (chip);
+        pricing.append (new Gtk.Label (SPANS[range]) { css_classes = { "caption", "dim-label" }, valign = Gtk.Align.CENTER });
+        box.append (pricing);
+
+        var grid = new Gtk.Grid () { column_spacing = 10, row_spacing = 3 };
+        var values = facts_of (q, now);
+        for (int i = 0; i < FACTS.length; i++) {
+            grid.attach (new Gtk.Label (FACTS[i]) { xalign = 0, css_classes = { "caption", "dim-label" } }, i / 6 * 2, i % 6);
+            grid.attach (new Gtk.Label (values[i]) { xalign = 0, hexpand = true, css_classes = { "caption", "numeric" } }, i / 6 * 2 + 1, i % 6);
+        }
+        box.append (grid);
+
+        // What is held of it, every lot together.
+        double shares = 0, gain = 0, capital = 0;
+        for (uint i = 0; i < p.lots.get_n_items (); i++) {
+            var l = (Lot) p.lots.get_item (i);
+            double g, k;
+            if (l.symbol != symbol) continue;
+            if (!p.lot_gain (l, Range.MAX, now, out g, out k)) continue;
+            shares += l.shares;
+            gain += g;
+            capital += k;
+        }
+        if (capital > 0) {
+            var holding = new Gtk.Label ("%.8g shares  ·  %s %s  ·  %s (%s)".printf (shares, money (capital + gain, p.currency), p.currency, delta (gain, p.currency), pct (gain / capital))) { xalign = 0, css_classes = { "caption", "numeric" } };
+            tint (holding, gain);
+            box.append (holding);
+        }
+        return box;
+    }
+
+    // Ask for the figures the cards show: one request for everything tracked, and no more often than
+    // every five minutes unless something new has been added (or the user refreshes).
+    async void fetch_stats () {
+        var now = now_s ();
+        var wanted = new GenericArray<Quote> ();
+        bool news = false;
+        for (uint i = 0; i < p.lots.get_n_items (); i++) {
+            var symbol = ((Lot) p.lots.get_item (i)).symbol;
+            var q = p.quotes[symbol];
+            if (q == null || wanted.find (q)) continue;
+            wanted.add (q);
+            news |= !stats_asked.contains (symbol);
+        }
+        if (stats_busy || wanted.length == 0 || (!news && now - stats_fetched < 300)) return;
+        stats_busy = true;
+        yield feed.load_stats (wanted);
+        for (int i = 0; i < wanted.length; i++) stats_asked.add (wanted[i].symbol);
+        stats_fetched = now;
+        stats_busy = false;
+        update ();
     }
 
     // ---- logos ----
@@ -445,19 +667,32 @@ public class Window : Adw.ApplicationWindow {
         return item;
     }
 
-    // The sidebar: each folder with the stocks filed in it, then the unfiled. Only stocks the heatmap
-    // lays out in its body are listed; an index or currency pair sits in the top row whatever folder
-    // it might be given. Rebuilt only when the arrangement changes, so a price refresh doesn't fold up
-    // what is open.
+    // The sidebar, shared by every page: the portfolio; each folder with the stocks filed in it, then
+    // the unfiled; then whatever sits in the heatmap's top row. A click opens a stock's card, the search
+    // field narrows the list. Rebuilt only when the arrangement (or what is open, or sought) changes,
+    // so a price refresh doesn't fold up what is open.
     void show_folders () {
         var tiles = p.tiles (range, now_s (), 1, 1);
-        var shape = new StringBuilder ();
+        var shape = new StringBuilder (@"$shown\n$sought\n");
+        bool held = false;
         for (int i = 0; i < p.groups.length; i++) shape.append (p.groups[i] + "\n");
-        for (int i = 0; i < tiles.length; i++)
-            if (tiles[i].kind == TileKind.STOCK) shape.append ("%s\t%s\t%s\t%d\n".printf (tiles[i].symbol, tiles[i].group, tiles[i].name, (int) logos.contains (tiles[i].symbol)));
+        for (int i = 0; i < tiles.length; i++) {
+            if (tiles[i].kind == TileKind.GROUP) continue;
+            held |= tiles[i].value > 0;
+            shape.append ("%s\t%s\t%s\t%d\t%d\n".printf (tiles[i].symbol, tiles[i].group, tiles[i].name, tiles[i].kind, (int) logos.contains (tiles[i].symbol)));
+        }
+        shape.append (held ? "held" : "");
         if (shape.str == folders_shown) return;
         folders_shown = shape.str;
         folders.remove_all ();
+
+        if (held && sought == "") {
+            var portfolio = new Adw.ActionRow () { title = "Portfolio", subtitle = "Totals and positions", activatable = true };
+            portfolio.add_prefix (new Gtk.Image.from_icon_name ("view-list-symbolic"));
+            portfolio.activated.connect (() => show_stock (""));
+            if (shown == "") portfolio.add_css_class ("picked");
+            folders.append (portfolio);
+        }
 
         string[] names = {};
         for (int i = 0; i < p.groups.length; i++) names += p.groups[i];
@@ -470,6 +705,7 @@ public class Window : Adw.ApplicationWindow {
             var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
             drop.drop.connect ((value, x, y) => {
                 var payload = value.get_string ();
+                if (!payload.has_prefix ("folder:") && p.is_benchmark (payload)) return false;   // the top row's stay there
                 // Later, not from inside the drop: it rebuilds this very list.
                 Idle.add (() => { dropped (payload, name, null, false); return Source.REMOVE; });
                 return true;
@@ -479,8 +715,6 @@ public class Window : Adw.ApplicationWindow {
                 var grab = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
                 grab.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value ("folder:" + name));
                 folder.add_controller (grab);
-            }
-            if (name != "") {
                 folder.add_suffix (new Gtk.Button.from_icon_name ("list-add-symbolic") {
                     tooltip_text = "Add a stock to this folder", valign = Gtk.Align.CENTER, css_classes = { "flat" },
                     action_name = "win.add-to", action_target = new Variant.string (name)
@@ -493,46 +727,72 @@ public class Window : Adw.ApplicationWindow {
             int count = 0;
             for (int i = 0; i < tiles.length; i++) {
                 var t = tiles[i];
-                if (t.kind != TileKind.STOCK || t.group != name) continue;
-                var targets = new Menu ();
-                for (int k = 0; k < p.groups.length; k++)
-                    if (p.groups[k] != name) targets.append_item (menu_item (p.groups[k], "win.move", new Variant ("(ss)", t.symbol, p.groups[k])));
-                if (name != "") targets.append_item (menu_item ("Ungrouped", "win.move", new Variant ("(ss)", t.symbol, "")));
-                var destinations = new Menu ();
-                destinations.append_section ("Move to", targets);
-                var row = new Adw.ActionRow () { use_markup = false, title = t.symbol, subtitle = t.name, subtitle_lines = 1 };
-                if (logos.contains (t.symbol)) row.add_prefix (new Gtk.Image.from_paintable (logos[t.symbol]) { pixel_size = 24 });
-                // Drag the row onto a folder here, or onto a folder's block in the heatmap.
-                var drag = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
-                unowned Gtk.DragSource source = drag;   // unowned, or the handler below would keep
-                unowned Adw.ActionRow shown = row;      // both alive after the list is rebuilt
-                drag.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value (t.symbol));
-                drag.drag_begin.connect ((d) => { source.set_icon (new Gtk.WidgetPaintable (shown), 0, 0); });
-                row.add_controller (drag);
-                // Dropped on this row: beside this stock, above or below by which half was hit.
-                var beside = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
-                beside.drop.connect ((value, x, y) => {
-                    var payload = value.get_string ();
-                    bool after = y > shown.get_height () / 2;
-                    if (payload == t.symbol) return false;
-                    Idle.add (() => { dropped (payload, name, t.symbol, after); return Source.REMOVE; });
-                    return true;
-                });
-                row.add_controller (beside);
-                row.add_suffix (new Gtk.MenuButton () {
-                    icon_name = "folder-symbolic", tooltip_text = "Move to folder", valign = Gtk.Align.CENTER,
-                    css_classes = { "flat" }, menu_model = destinations, sensitive = targets.get_n_items () > 0
-                });
-                folder.add_row (row);
+                if (t.kind != TileKind.STOCK || t.group != name || !(@"$(t.symbol) $(t.name)".down ().contains (sought))) continue;
+                folder.add_row (sidebar_row (t, name));
                 count++;
             }
             // Spelled out with ifs: valac 0.56 frees the inner result of a nested ?: over strings too early.
             folder.subtitle = "Empty";
             if (count == 1) folder.subtitle = "1 stock";
             if (count > 1) folder.subtitle = @"$count stocks";
-            // Ungrouped stays listed while there are folders, so there is somewhere to drag a stock back out to.
-            if (name != "" || count > 0 || p.groups.length > 0) folders.append (folder);
+            // Ungrouped stays listed while there are folders, so there is somewhere to drag a stock back
+            // out to. While searching, only folders with something found in them are.
+            if (sought != "" ? count > 0 : (name != "" || count > 0 || p.groups.length > 0)) folders.append (folder);
         }
+
+        // The heatmap's top row: what is watched that isn't a company's stock.
+        var top = new Adw.ExpanderRow () { title = "Top row", subtitle = "Indices, funds and pairs you watch", expanded = true };
+        top.add_prefix (new Gtk.Image.from_icon_name ("starred-symbolic"));
+        int listed = 0;
+        for (int i = 0; i < tiles.length; i++) {
+            var t = tiles[i];
+            if (t.kind != TileKind.BENCHMARK || !(@"$(t.symbol) $(t.name)".down ().contains (sought))) continue;
+            top.add_row (sidebar_row (t, ""));
+            listed++;
+        }
+        if (listed > 0) folders.append (top);
+    }
+
+    // One row of the sidebar: a tracked symbol. Click it to open its card; drag it to arrange; its menu
+    // moves a stock between folders, or takes the symbol off the list.
+    Adw.ActionRow sidebar_row (Tile t, string folder) {
+        bool top = t.kind == TileKind.BENCHMARK;
+        var row = new Adw.ActionRow () { use_markup = false, title = t.symbol, subtitle = t.name, subtitle_lines = 1, activatable = true };
+        if (t.symbol == shown) row.add_css_class ("picked");
+        if (logos.contains (t.symbol)) row.add_prefix (new Gtk.Image.from_paintable (logos[t.symbol]) { pixel_size = 24 });
+        row.activated.connect (() => show_stock (t.symbol));
+
+        // Drag the row onto a folder or another row here, or onto the heatmap.
+        var drag = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
+        unowned Gtk.DragSource source = drag;   // unowned, or the handler below would keep
+        unowned Adw.ActionRow self = row;       // both alive after the list is rebuilt
+        drag.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value (t.symbol));
+        drag.drag_begin.connect ((d) => { source.set_icon (new Gtk.WidgetPaintable (self), 0, 0); });
+        row.add_controller (drag);
+        // Dropped on this row: beside it, above or below by which half was hit. Only its own kind: a
+        // stock among the stocks, a top-row entry within the top row.
+        var beside = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
+        beside.drop.connect ((value, x, y) => {
+            var payload = value.get_string ();
+            bool after = y > self.get_height () / 2;
+            bool fits = payload.has_prefix ("folder:") ? !top : p.is_benchmark (payload) == top;
+            if (payload == t.symbol || !fits) return false;
+            Idle.add (() => { dropped (payload, folder, t.symbol, after); return Source.REMOVE; });
+            return true;
+        });
+        row.add_controller (beside);
+
+        var menu = new Menu ();
+        var targets = new Menu ();
+        for (int k = 0; !top && k < p.groups.length; k++)
+            if (p.groups[k] != folder) targets.append_item (menu_item (p.groups[k], "win.move", new Variant ("(ss)", t.symbol, p.groups[k])));
+        if (!top && folder != "") targets.append_item (menu_item ("Ungrouped", "win.move", new Variant ("(ss)", t.symbol, "")));
+        if (targets.get_n_items () > 0) menu.append_section ("Move to", targets);
+        var last = new Menu ();
+        last.append_item (menu_item ("Remove", "win.remove", new Variant.string (t.symbol)));
+        menu.append_section (null, last);
+        row.add_suffix (new Gtk.MenuButton () { icon_name = "view-more-symbolic", valign = Gtk.Align.CENTER, css_classes = { "flat" }, menu_model = menu });
+        return row;
     }
 
     // Name a new folder (old = "") or rename an existing one.
@@ -586,6 +846,7 @@ public class Window : Adw.ApplicationWindow {
         }
         loading.remove (symbol);
         if (loading.length == 0) {
+            fetch_stats.begin ();
             updated = new DateTime.now_local ().format (round_failed ? "Update failed %H:%M" : "Updated %H:%M");
             failing = round_failed;
             round_failed = false;
@@ -827,6 +1088,29 @@ public class Window : Adw.ApplicationWindow {
         save ();
         sync ();
         update ();
+    }
+
+    // Take a symbol off the list, every lot of it, with a way back.
+    void remove_symbol (string symbol) {
+        Lot[] gone = {};
+        uint[] places = {};
+        for (int i = (int) p.lots.get_n_items () - 1; i >= 0; i--) {
+            var lot = (Lot) p.lots.get_item (i);
+            if (lot.symbol != symbol) continue;
+            gone += lot;
+            places += (uint) i;
+            p.lots.remove (i);
+        }
+        if (gone.length == 0) return;
+        save ();
+        update ();
+        var toast = new Adw.Toast (@"Removed $symbol") { button_label = "Undo" };
+        toast.button_clicked.connect (() => {
+            for (int i = gone.length - 1; i >= 0; i--) p.lots.insert (uint.min (places[i], p.lots.get_n_items ()), gone[i]);   // lowest place first
+            save ();
+            update ();
+        });
+        toasts.add_toast (toast);
     }
 
     void remove_lot (Lot lot) {

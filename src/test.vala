@@ -261,6 +261,14 @@ void main () {
     assert (cache.load_names (NOW + DAY)["GOOG"] == "Alphabet Inc. - Class C Capital Stock");
     assert (cache.load_names (NOW + 8 * DAY) == null);                                  // a week on, they are due again
 
+    // --- standing in for a range the feed doesn't give ---
+    double lowest, highest;
+    Quote.extremes (a.daily, T0 + 5 * DAY, out lowest, out highest);                    // days 5..9 close at 105..109
+    near (lowest, 105);
+    near (highest, 109);
+    Quote.extremes (a.daily, NOW + DAY, out lowest, out highest);
+    assert (!lowest.is_finite () && !highest.is_finite ());
+
     // --- when a quote is worth asking about again ---
     var d = quote ("D", "USD", 100, 1);
     d.opens = NOW - 3600;

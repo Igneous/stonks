@@ -20,6 +20,11 @@ public class Treemap : Gtk.DrawingArea {
     // Something was dropped: a symbol, or "folder:" and a folder's name. `folder` is the folder it
     // landed in; `target`, if any, the symbol it was dropped on, to go before or `after` it.
     public signal void dropped (string payload, string folder, string? target, bool after);
+    public signal void opened (string symbol);   // a tile was double-clicked
+    public signal void peeked (string symbol);   // a tile has been hovered long enough: time to fill `card`
+    public Gtk.Popover card = new Gtk.Popover () { autohide = false };   // the hover card; whoever hears `peeked` sets its child
+    string hovered = "";   // the symbol under the pointer
+    uint hover_timer;
     Portfolio p;
     GenericArray<Tile> tiles = new GenericArray<Tile> ();
     string dragged = "";   // what is being dragged out of here
@@ -29,8 +34,41 @@ public class Treemap : Gtk.DrawingArea {
 
     public Treemap (Portfolio p) {
         this.p = p;
-        has_tooltip = true;
         set_draw_func (paint);
+        card.set_parent (this);
+
+        // Rest on a tile for a moment and its card comes up beside it; move on and it goes.
+        var hover = new Gtk.EventControllerMotion ();
+        hover.motion.connect ((x, y) => {
+            var t = at (x, y, TileKind.STOCK) ?? at (x, y, TileKind.BENCHMARK);
+            var symbol = t != null ? t.symbol : "";
+            if (symbol == hovered) return;
+            unhover ();
+            hovered = symbol;
+            if (t == null) return;
+            Gdk.Rectangle tile = { (int) t.x, (int) t.y, (int) t.w, (int) t.h };
+            hover_timer = Timeout.add (1200, () => {
+                hover_timer = 0;
+                card.child = null;
+                peeked (symbol);
+                if (card.child != null) {
+                    card.pointing_to = tile;
+                    card.popup ();
+                }
+                return Source.REMOVE;
+            });
+        });
+        hover.leave.connect (unhover);
+        add_controller (hover);
+
+        var click = new Gtk.GestureClick ();
+        click.pressed.connect ((presses, x, y) => {
+            var t = at (x, y, TileKind.STOCK) ?? at (x, y, TileKind.BENCHMARK);
+            if (presses != 2 || t == null) return;
+            unhover ();
+            opened (t.symbol);
+        });
+        add_controller (click);
 
         // Drag a tile out (to another spot here, or to the sidebar); a folder goes by its header band.
         var drag = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
@@ -43,6 +81,7 @@ public class Treemap : Gtk.DrawingArea {
             return new Gdk.ContentProvider.for_value (dragged);
         });
         drag.drag_begin.connect ((d) => {
+            unhover ();
             var name = dragged.has_prefix ("folder:") ? dragged.substring (7) : dragged;
             ((Gtk.DragIcon) Gtk.DragIcon.get_for_drag (d)).child = new Gtk.Label (@"  $name  ") { height_request = 34, css_classes = { "heading", "card" } };
         });
@@ -75,19 +114,24 @@ public class Treemap : Gtk.DrawingArea {
             return true;
         });
         add_controller (drop);
+    }
 
-        query_tooltip.connect ((x, y, keyboard, tip) => {
-            for (int i = 0; i < tiles.length; i++) {
-                var t = tiles[i];
-                if (t.kind == TileKind.GROUP || x < t.x || x >= t.x + t.w || y < t.y || y >= t.y + t.h) continue;
-                var worth = t.value > 0 ? "%s %s".printf (money (t.value, p.currency), p.currency) : "Watching";
-                if (t.kind == TileKind.BENCHMARK) worth = "%s %s".printf (money (t.price, t.currency), t.currency);
-                tip.set_text ("%s · %s\n%s · %s over %s".printf (t.symbol, t.name, worth, pct (t.change), RANGE_LABELS[range]));
-                tip.set_tip_area ({ (int) t.x, (int) t.y, (int) t.w, (int) t.h });
-                return true;
-            }
-            return false;
-        });
+    void unhover () {
+        if (hover_timer != 0) Source.remove (hover_timer);
+        hover_timer = 0;
+        hovered = "";
+        card.popdown ();
+    }
+
+    // A popover lives off its parent's allocation, and is its parent's to let go of.
+    public override void size_allocate (int width, int height, int baseline) {
+        base.size_allocate (width, height, baseline);
+        card.present ();
+    }
+
+    public override void dispose () {
+        card.unparent ();
+        base.dispose ();
     }
 
     // Give a symbol's tile a logo to show (null takes it away again).
