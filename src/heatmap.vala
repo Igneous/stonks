@@ -74,6 +74,37 @@ public class Treemap : Gtk.DrawingArea {
         });
     }
 
+    // A stock's tile: its symbol, its change and its name, stacked and centered. The name is what says
+    // which company 8306.T is, so it stays: it wraps onto two lines, is cut with an ellipsis beyond
+    // that, and the whole label shrinks before anything is left out. Only a tile too low for three
+    // lines of the smallest text loses the name, and then the change.
+    void label (Cairo.Context cr, Tile t) {
+        double fit = double.min (t.w / 8, t.h / 4).clamp (7, 26), inner = t.w - 10;
+        bool named = t.name != "" && t.name != t.symbol;
+        for (int parts = named ? 3 : 2; parts >= 1; parts--) {
+            foreach (double scale in new double[] { 1, 0.8, 0.64, 0.5 }) {
+                double size = double.max (fit * scale, 6);
+                Pango.Layout[] rows = { text_layout (this, "<span font_desc='Bold %.1f'>%s</span>".printf (size, Markup.escape_text (t.symbol)), true, inner, 1) };
+                if (parts >= 2) rows += text_layout (this, "<span font_desc='%.1f'>%s</span>".printf (size * 0.75, pct (t.change)), true, inner, 1);
+                if (parts >= 3) rows += text_layout (this, "<span font_desc='%.1f' alpha='75%%'>%s</span>".printf (size * 0.5 + 3, Markup.escape_text (t.name)), true, inner, 2);
+                int total = 0, w, h;
+                foreach (var row in rows) {
+                    row.get_pixel_size (out w, out h);
+                    total += h;
+                }
+                if (total > t.h - 6) continue;
+                double y = t.y + (t.h - total) / 2;
+                foreach (var row in rows) {
+                    row.get_pixel_size (out w, out h);
+                    cr.move_to (t.x + 5, y);
+                    Pango.cairo_show_layout (cr, row);
+                    y += h;
+                }
+                return;
+            }
+        }
+    }
+
     // The tile of a kind under a point, if any. (A folder's block covers its stocks' tiles.)
     Tile? at (double x, double y, TileKind kind) {
         for (int i = 0; i < tiles.length; i++) {
@@ -91,10 +122,12 @@ public class Treemap : Gtk.DrawingArea {
             var t = tiles[i];
             var symbol = Markup.escape_text (t.symbol), name = Markup.escape_text (t.name);
             if (t.kind == TileKind.GROUP) {
-                // A folder: a dark band across the top of its region, named and carrying its average move.
+                // A folder: a dark card laid behind its stocks (which come next in the list and are set
+                // in from its edges), so it shows as a frame around them with a band across the top,
+                // named and carrying their average move.
                 double head = double.min (Portfolio.GROUP_HEADER, t.h / 3);
                 cr.set_source_rgb (0.13, 0.14, 0.17);
-                cr.rectangle (t.x + 1, t.y + 1, t.w - 2, head - 1);
+                cr.rectangle (t.x + 1, t.y + 1, t.w - 2, t.h - 2);
                 cr.fill ();
                 cr.set_source_rgb (1, 1, 1);
                 string[] labels = { "<b>%s</b>   %s".printf (symbol, pct (t.change)), "<b>%s</b>".printf (symbol) };
@@ -114,25 +147,21 @@ public class Treemap : Gtk.DrawingArea {
                 cr.stroke ();
                 cr.set_dash (null, 0);
             }
-            // Text scales with the tile; show as much as fits.
-            string[] fits;
-            if (t.kind == TileKind.BENCHMARK) {
-                // An index or a currency pair is known by its name and its level, not by Yahoo's ticker for it.
-                double size = double.min (t.w / 11, t.h / 3.6).clamp (7, 15);
-                var level = "<span font_desc='%.0f'>%s   %s</span>".printf (size * 0.85, money (t.price, t.currency), pct (t.change));
-                fits = {
-                    "<span font_desc='Bold %.0f'>%s</span>\n%s".printf (size, name, level),
-                    "<span font_desc='Bold %.0f'>%s</span>\n%s".printf (size, symbol, level),
-                    "<span font_desc='Bold %.0f'>%s</span>\n<span font_desc='%.0f'>%s</span>".printf (size, symbol, size * 0.85, pct (t.change)),
-                    "<span font_desc='Bold %.0f'>%s</span>".printf (size, symbol)
-                };
-            } else {
-                double size = double.min (t.w / 8, t.h / 4).clamp (7, 26);
-                var head = "<span font_desc='Bold %.0f'>%s</span>".printf (size, symbol);
-                var move = "<span font_desc='%.0f'>%s</span>".printf (size * 0.75, pct (t.change));
-                fits = { "%s\n%s\n<span font_desc='%.0f' alpha='75%%'>%s</span>".printf (head, move, size * 0.5 + 3, name), @"$head\n$move", head };
-            }
             cr.set_source_rgb (1, 1, 1);
+            if (t.kind == TileKind.STOCK) {
+                label (cr, t);
+                continue;
+            }
+            // The top row. An index or a currency pair is known by its name and its level, not by Yahoo's
+            // ticker for it; show as much as fits.
+            double size = double.min (t.w / 11, t.h / 3.6).clamp (7, 15);
+            var level = "<span font_desc='%.0f'>%s   %s</span>".printf (size * 0.85, money (t.price, t.currency), pct (t.change));
+            string[] fits = {
+                "<span font_desc='Bold %.0f'>%s</span>\n%s".printf (size, name, level),
+                "<span font_desc='Bold %.0f'>%s</span>\n%s".printf (size, symbol, level),
+                "<span font_desc='Bold %.0f'>%s</span>\n<span font_desc='%.0f'>%s</span>".printf (size, symbol, size * 0.85, pct (t.change)),
+                "<span font_desc='Bold %.0f'>%s</span>".printf (size, symbol)
+            };
             foreach (var markup in fits)
                 if (draw_text (this, cr, markup, t.x + t.w / 2, t.y + t.h / 2, 0.5, 0.5, t.w - 10, t.h - 6)) break;
         }
@@ -188,7 +217,7 @@ public class Matrix : Gtk.DrawingArea {
             var t = row > 0 ? tiles[row - 1] : null;
             var label = t != null ? "<b>%s</b>  <span alpha='60%%'>%s</span>".printf (Markup.escape_text (t.symbol), Markup.escape_text (t.name)) : "<b>Portfolio</b>";
             cr.set_source_rgba (fg.red, fg.green, fg.blue, 1);
-            draw_text (this, cr, label, 12, y + ROW / 2.0, 0, 0.5, label_w - 20, ROW, true);
+            draw_text (this, cr, label, 12, y + ROW / 2.0, 0, 0.5, label_w - 20, ROW, 1);
 
             for (int c = 0; c < RANGE_LABELS.length; c++) {
                 double change;

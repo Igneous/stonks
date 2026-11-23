@@ -15,22 +15,31 @@ string compact (double v) {
     return "%'.0f".printf (v);
 }
 
-// Draw Pango markup in the current cairo color, its (ax, ay) fraction anchored at (x, y).
-// Text that would not fit in max_w x max_h is cut short with an ellipsis if `ellipsize`; otherwise
-// nothing is drawn and the result is false.
-bool draw_text (Gtk.Widget widget, Cairo.Context cr, string markup, double x, double y, double ax, double ay,
-                double max_w = double.MAX, double max_h = double.MAX, bool ellipsize = false) {
+// A Pango layout of some markup. With `lines` > 0 it is kept to max_w: wrapped onto at most that many
+// lines per paragraph, the rest cut with an ellipsis. With 0 it is left as wide as it comes.
+Pango.Layout text_layout (Gtk.Widget widget, string markup, bool centered, double max_w = double.MAX, int lines = 0) {
     var layout = widget.create_pango_layout (null);
     layout.set_markup (markup, -1);
-    layout.set_alignment (ax == 0.5 ? Pango.Alignment.CENTER : Pango.Alignment.LEFT);
-    if (ellipsize) {
+    layout.set_alignment (centered ? Pango.Alignment.CENTER : Pango.Alignment.LEFT);
+    if (lines > 0) {
         layout.set_width ((int) (max_w * Pango.SCALE));
+        layout.set_wrap (Pango.WrapMode.WORD_CHAR);
         layout.set_ellipsize (Pango.EllipsizeMode.END);
+        layout.set_height (-lines);
     }
+    return layout;
+}
+
+// Draw Pango markup in the current cairo color, its (ax, ay) fraction anchored at (x, y).
+// If it would not fit in max_w x max_h, nothing is drawn and the result is false; `lines` > 0 makes the
+// width always fit, by wrapping and cutting as text_layout() does.
+bool draw_text (Gtk.Widget widget, Cairo.Context cr, string markup, double x, double y, double ax, double ay,
+                double max_w = double.MAX, double max_h = double.MAX, int lines = 0) {
+    var layout = text_layout (widget, markup, ax == 0.5, max_w, lines);
     int w, h;
     layout.get_pixel_size (out w, out h);
-    if (w > max_w || h > max_h) return false;
-    cr.move_to (x - w * ax, y - h * ay);
+    if ((lines == 0 && w > max_w) || h > max_h) return false;
+    cr.move_to (x - (lines > 0 ? max_w : w) * ax, y - h * ay);
     Pango.cairo_show_layout (cr, layout);
     return true;
 }

@@ -160,7 +160,9 @@ void main () {
     near (tiles[1].w * tiles[1].h, rest * 1655 / (1655 + 827.5));                 // a folder is as big as its stocks
     near (tiles[1].change, (1635 * (109.0 / 108 - 1) + 20 * 0) / 1655);           // and moves as their weighted average
     near (tiles[2].y, tiles[1].y + Portfolio.GROUP_HEADER);                       // stocks start below its label
-    near (tiles[2].w * tiles[2].h + tiles[3].w * tiles[3].h, tiles[1].w * (tiles[1].h - Portfolio.GROUP_HEADER));
+    near (tiles[2].x, tiles[1].x + Portfolio.GROUP_BORDER);                       // and inside its frame
+    near (tiles[2].w * tiles[2].h + tiles[3].w * tiles[3].h,
+          (tiles[1].w - 2 * Portfolio.GROUP_BORDER) * (tiles[1].h - Portfolio.GROUP_HEADER - Portfolio.GROUP_BORDER));
     p.gain (Range.MAX, NOW, out gain, out capital);
     near (capital, 10 * 90 + 5 * 104 + 10);                                       // none of this touches the totals
 

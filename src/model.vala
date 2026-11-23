@@ -209,6 +209,7 @@ public class Portfolio {
     public GenericArray<string> groups = new GenericArray<string> ();
 
     public const double GROUP_HEADER = 22;    // pixels kept free at the top of a folder's region for its label
+    public const double GROUP_BORDER = 3;     // ...and around its other three sides, so it reads as a frame
     public const double BENCHMARK_ROW = 64;   // height of the row along the top
 
     // Whether a symbol is on the list itself, as opposed to an FX pair we only convert totals through.
@@ -422,8 +423,8 @@ public class Portfolio {
             var members = new GenericArray<Tile> ();
             for (int k = 0; k < body.length; k++) if (body[k].group == g.group) members.add (body[k]);
             members.sort (by_weight);
-            double head = double.min (GROUP_HEADER, g.h / 3);
-            layout (members, 0, members.length, g.x, g.y + head, g.w, g.h - head);
+            double head = double.min (GROUP_HEADER, g.h / 3), edge = double.min (GROUP_BORDER, g.w / 8);
+            layout (members, 0, members.length, g.x + edge, g.y + head, g.w - 2 * edge, g.h - head - edge);
             for (int k = 0; k < members.length; k++) result.add (members[k]);
         }
         return result;
