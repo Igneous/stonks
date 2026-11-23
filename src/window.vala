@@ -396,8 +396,17 @@ public class Window : Adw.ApplicationWindow {
                     var found = feed.search.end (res);
                     if (mine != serial) return;
                     hits.remove_all ();
-                    foreach (var hit in found)
-                        hits.append (new Adw.ActionRow () { use_markup = false, title = hit.symbol, subtitle = hit.name + "\n" + hit.detail, activatable = true });
+                    foreach (var hit in found) {
+                        var row = new Adw.ActionRow () { use_markup = false, title = hit.symbol, subtitle = hit.name + "\n" + hit.detail, activatable = true };
+                        // On the right: the price now and, where there is one, the market cap.
+                        if (hit.price.is_finite ()) {
+                            // Penny stocks and small coins would all read 0.00 at two decimals.
+                            var numbers = "%s %s".printf (hit.price < 1 ? "%.4g".printf (hit.price) : money (hit.price, hit.currency), hit.currency);
+                            if (hit.cap.is_finite ()) numbers += "\n<span alpha='65%%'><small>Mkt cap %s</small></span>".printf (compact (hit.cap));
+                            row.add_suffix (new Gtk.Label (numbers) { use_markup = true, xalign = 1, justify = Gtk.Justification.RIGHT, css_classes = { "numeric" } });
+                        }
+                        hits.append (row);
+                    }
                     hits.visible = found.length > 0;
                 });
                 return Source.REMOVE;

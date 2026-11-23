@@ -15,6 +15,9 @@ public class Hit {
     public string symbol;
     public string name;     // as full as we can get it: "Alphabet Inc. - Class C Capital Stock"
     public string detail;   // exchange, type, sector, industry
+    public string currency = "";
+    public double price = double.NAN;   // NaN where the source has none
+    public double cap = double.NAN;     // market capitalisation, in `currency`
 }
 
 public class Feed {
@@ -24,6 +27,11 @@ public class Feed {
     // Yahoo answers 429 to user agents that don't look like a browser.
     Soup.Session session = new Soup.Session () { user_agent = "Mozilla/5.0 (X11; Linux x86_64)", timeout = 30 };
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
+    string? crumb;                      // see price_hits()
+
+    public Feed () {
+        session.add_feature (new Soup.CookieJar ());   // for the cookie price_hits() needs
+    }
 
     async Json.Object get_json (string url) throws Error {
         var msg = new Soup.Message ("GET", url);
@@ -95,11 +103,21 @@ public class Feed {
         for (int i = 0; i < code.length; i++) plausible &= code[i].isalnum ();
         if (plausible) {
             var info = yield ssi_info (code);
-            if (info != null) hits += new Hit () {
-                symbol = code + ".VN",
-                name = info.get_string_member_with_default ("companyNameEn", code),
-                detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ())
-            };
+            if (info != null) {
+                var hit = new Hit () {
+                    symbol = code + ".VN",
+                    name = info.get_string_member_with_default ("companyNameEn", code),
+                    detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ()),
+                    currency = "VND",
+                    price = info.get_double_member_with_default ("refPrice", double.NAN)   // yesterday's close, unless...
+                };
+                try {
+                    var bars = yield ssi_bars (code, "5", get_real_time () / 1000000 - 7 * 86400);
+                    if (bars.n > 0) hit.price = bars.v[bars.n - 1];                          // ...it has traded since
+                } catch (Error e) {}
+                hit.cap = hit.price * info.get_double_member_with_default ("listedShare", double.NAN);
+                hits += hit;
+            }
         }
         try {
             var root = yield get_json (@"$YAHOO/v1/finance/search?q=$(Uri.escape_string (text))&quotesCount=5&newsCount=0");
@@ -119,7 +137,41 @@ public class Feed {
                 };
             }
         } catch (Error e) {}
+        yield price_hits (hits);
         return hits;
+    }
+
+    // Fill in price and market cap for the Yahoo hits, all in one request. Unlike Yahoo's other
+    // endpoints this one wants a cookie plus a matching "crumb" token; Yahoo hands both to anyone who
+    // asks, no account involved. If it stops working the hits simply come without numbers.
+    async void price_hits (Hit[] hits) {
+        string[] symbols = {};
+        foreach (var hit in hits) if (!hit.price.is_finite ()) symbols += hit.symbol;
+        if (symbols.length == 0) return;
+        try {
+            if (crumb == null) {
+                yield session.send_and_read_async (new Soup.Message ("GET", "https://fc.yahoo.com"), Priority.DEFAULT, null);   // a 404 that sets the cookie
+                var reply = yield session.send_and_read_async (new Soup.Message ("GET", "https://query2.finance.yahoo.com/v1/test/getcrumb"), Priority.DEFAULT, null);
+                crumb = reply.get_size () > 0 ? ((string) reply.get_data ()).substring (0, (long) reply.get_size ()) : "";
+            }
+            var root = yield get_json (@"$YAHOO/v7/finance/quote?fields=regularMarketPrice,currency,marketCap&crumb=$(Uri.escape_string (crumb))&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
+            if (!root.has_member ("quoteResponse")) {
+                crumb = null;   // refused: the crumb went stale, so get a new one next time
+                return;
+            }
+            var quotes = root.get_object_member ("quoteResponse").get_array_member ("result");
+            for (uint i = 0; i < quotes.get_length (); i++) {
+                var o = quotes.get_object_element (i);
+                foreach (var hit in hits) {
+                    if (hit.symbol != o.get_string_member_with_default ("symbol", "")) continue;
+                    hit.currency = o.get_string_member_with_default ("currency", "");
+                    hit.price = o.get_double_member_with_default ("regularMarketPrice", double.NAN);
+                    hit.cap = o.get_double_member_with_default ("marketCap", double.NAN);   // funds and warrants have none
+                }
+            }
+        } catch (Error e) {
+            crumb = null;
+        }
     }
 
     // ---- Yahoo ----

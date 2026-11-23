@@ -7,6 +7,14 @@ string money (double v, string currency) { return v.is_finite () ? "%'.*f".print
 string delta (double v, string currency) { return v.is_finite () ? "%+'.*f".printf (decimals (currency), v) : "—"; }
 string pct (double f) { return f.is_finite () ? "%+.2f%%".printf (f * 100) : "—"; }
 
+// Market-cap sized numbers: 3.25T, 812.40B, 45.10M.
+string compact (double v) {
+    if (v >= 1e12) return "%'.2fT".printf (v / 1e12);
+    if (v >= 1e9) return "%.2fB".printf (v / 1e9);
+    if (v >= 1e6) return "%.2fM".printf (v / 1e6);
+    return "%'.0f".printf (v);
+}
+
 // Draw Pango markup in the current cairo color, its (ax, ay) fraction anchored at (x, y).
 // Text that would not fit in max_w x max_h is cut short with an ellipsis if `ellipsize`; otherwise
 // nothing is drawn and the result is false.
