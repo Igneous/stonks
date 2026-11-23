@@ -326,8 +326,9 @@ public class Window : Adw.ApplicationWindow {
         update ();
         sync (true);
         feed.load_names.begin ();
-        // ponytail: one request per symbol every two minutes. Yahoo publishes no limit for these
-        // endpoints; lengthen this if a large portfolio starts drawing HTTP 429.
+        // ponytail: a round every two minutes, which is one request per twenty Yahoo symbols whose
+        // market is open (see Feed.refresh). Yahoo publishes no limit for these endpoints; lengthen
+        // this if a large portfolio starts drawing HTTP 429.
         Timeout.add_seconds (120, () => { sync (true); return Source.CONTINUE; });
     }
 
@@ -921,33 +922,59 @@ public class Window : Adw.ApplicationWindow {
     // have, but only those that are due (see Quote.due); `force` refreshes them regardless.
     void sync (bool all = false, bool force = false) {
         var now = now_s ();
+        var stale = new GenericArray<Quote> ();
         foreach (var symbol in p.wanted ()) {
+            if (loading.contains (symbol)) continue;
             var q = p.quotes[symbol];
+            if (q == null) {
+                load_symbol.begin (symbol);
+                continue;
+            }
             // A pair we only convert totals through needn't be to the minute: a quarter of an hour will do.
-            bool due = q != null && (p.tracks (symbol) ? q.due (now) : now - q.refreshed >= 900);
-            if (!loading.contains (symbol) && (q == null || (all && (force || due)))) load_symbol.begin (symbol);
+            bool due = p.tracks (symbol) ? q.due (now) : now - q.refreshed >= 900;
+            if (all && (force || due)) stale.add (q);
         }
+        if (stale.length > 0) freshen.begin (stale);
     }
 
-    // `asked`: the user is waiting on this symbol, so always say why it failed.
-    async void load_symbol (string symbol, bool asked = false) {
-        loading.add (symbol);
+    // Bring quotes we hold up to date, all in one go so that the feed can answer for many at once.
+    // A background round reports an outage once, not every two minutes.
+    async void freshen (GenericArray<Quote> quotes, bool asked = false) {
+        for (int i = 0; i < quotes.length; i++) loading.add (quotes[i].symbol);
         status.label = "Updating…";
-        try {
-            var q = p.quotes[symbol];
-            bool known = q != null;
-            if (q == null) {
-                q = feed.cached (symbol);
-                if (q != null) p.quotes[symbol] = q;   // shown as it was, even if the refresh below fails
+        var wrong = yield feed.refresh (quotes);
+        if (wrong != null && (asked || !failing)) fail (wrong);
+        if (wrong != null && !asked) round_failed = true;
+        for (int i = 0; i < quotes.length; i++) loading.remove (quotes[i].symbol);
+        settle ();
+    }
+
+    // A symbol we hold nothing of yet: out of the cache and freshened if it has been seen before,
+    // otherwise its one big download. `asked`: the user is waiting on it, so always say why it failed.
+    async void load_symbol (string symbol, bool asked = false) {
+        var q = feed.cached (symbol);
+        if (q != null) {
+            p.quotes[symbol] = q;   // shown as it was, even if the refresh fails
+            var one = new GenericArray<Quote> ();
+            one.add (q);
+            yield freshen (one, asked);
+        } else {
+            loading.add (symbol);
+            status.label = "Updating…";
+            try {
+                p.quotes[symbol] = yield feed.download (symbol);
+            } catch (Error e) {
+                if (asked || !failing) fail (@"$symbol: $(e.message)");
+                if (!asked) round_failed = true;
             }
-            if (q == null) p.quotes[symbol] = yield feed.download (symbol);
-            else yield feed.refresh (q);
-            if (!known) sync ();   // a new holding can need FX pairs we don't have yet
-        } catch (Error e) {
-            if (asked || !failing) fail (@"$symbol: $(e.message)");   // background refreshes report an outage once
-            if (!asked) round_failed = true;
+            loading.remove (symbol);
+            settle ();
         }
-        loading.remove (symbol);
+        if (p.quotes.contains (symbol)) sync ();   // a new holding can need FX pairs we don't have yet
+    }
+
+    // After each load: once nothing is loading any more, the round is over.
+    void settle () {
         if (loading.length == 0) {
             fetch_stats.begin ();
             updated = new DateTime.now_local ().format (round_failed ? "Update failed %H:%M" : "Updated %H:%M");

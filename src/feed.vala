@@ -1,4 +1,4 @@
-// Where prices come from. Two sources, both keyless and unofficial, so either can change or throttle:
+// Where prices come from. Keyless and unofficial sources, so any of them can change or throttle:
 //
 //   Yahoo Finance   everything but Vietnam. These are the chart and search endpoints finance.yahoo.com
 //                   itself calls; Yahoo retired its official API in 2017 and there is no key to get.
@@ -7,14 +7,15 @@
 //                   terminal also has Hanoi (HNX) and UPCoM, with history back to 2006.
 //                   Drop-in alternatives that returned identical bars when this was written:
 //                   services.entrade.com.vn/chart-api/v2/ohlcs/stock and dchart-api.vndirect.com.vn/dchart/history.
+//   CNBC            only the past of an index Yahoo has no history for (see with_past).
 //
 // Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities, and
 // logos come from wherever logo() says.
 //
-// Being a polite guest of all three: everything fetched goes into the on-disk Cache, so a symbol's
+// Being a polite guest of them all: everything fetched goes into the on-disk Cache, so a symbol's
 // whole history is downloaded once and after that only the bars since the last ones we have; a quote
-// is refreshed only when Quote.due() says its market could have moved; and the name directory is
-// fetched once a week.
+// is refreshed only when Quote.due() says its market could have moved, twenty symbols to a request
+// where the feed allows (see refresh); and the name directory is fetched once a week.
 namespace Stonks {
 
 // A search result.
@@ -72,6 +73,9 @@ public class Feed {
     const string YAHOO = "https://query1.finance.yahoo.com";
     const string SSI_BARS = "https://iboard-api.ssi.com.vn/statistics/charts/history";
     const string SSI_INFO = "https://iboard-query.ssi.com.vn/stock";
+    const string CNBC_BARS = "https://ts-api.cnbc.com/harmony/app/bars";
+    const int BATCH = 20;   // the most symbols Yahoo's spark endpoint takes in one request
+    const string[] REACHES = { "1d", "7d", "1mo", "3mo", "1y" };   // how far back a spark request can ask
     // Yahoo answers 429 to user agents that don't look like a browser.
     Soup.Session session = new Soup.Session () { user_agent = "Mozilla/5.0 (X11; Linux x86_64)", timeout = 30 };
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
@@ -144,23 +148,142 @@ public class Feed {
         return q;
     }
 
-    // Bring a quote up to date: the price, and the 5-minute bars since the last ones it has. Twice a
-    // day at most it also makes sure its daily history still matches the feed's.
-    public async void refresh (Quote q) throws Error {
+    // Bring quotes up to date: the price, and the 5-minute bars since the last ones each has. Twice a
+    // day at most a quote's daily history is also held against the feed's.
+    // In as few requests as the feeds allow, and one after another: Yahoo answers for twenty symbols
+    // at a time, so a hundred of them cost five requests a round rather than a hundred. SSI has to be
+    // asked about each on its own, and so do small exchange rates (see coarse). Trouble reaching a
+    // feed ends that feed's round there (one that is refusing us isn't asked nineteen more times).
+    // Returns the first thing that went wrong, or null.
+    public async string? refresh (GenericArray<Quote> quotes) {
         var now = get_real_time () / 1000000;
-        if (now - q.checked > 12 * 3600) yield catch_up (q, now);
-        if (from_ssi (q.symbol)) yield refresh_ssi (q); else yield refresh_yahoo (q);
-        q.refreshed = now;
-        cache.save (q, now);
+        string? wrong = null;
+        var yahoo = new GenericArray<Quote> ();
+        var exact = new GenericArray<Quote> ();
+        bool ssi_down = false;
+        for (int i = 0; i < quotes.length; i++) {
+            var q = quotes[i];
+            if (!from_ssi (q.symbol)) (coarse (q) ? exact : yahoo).add (q);
+            if (!from_ssi (q.symbol) || ssi_down) continue;
+            try {
+                if (now - q.checked > 12 * 3600) {
+                    var tail = yield ssi_bars (q.symbol, "1D", q.daily.t[q.daily.n - 1] - 12 * 86400);
+                    yield reconcile (q, tail, now);
+                }
+                yield refresh_ssi (q);
+                q.refreshed = now;
+                cache.save (q, now);
+            } catch (Error e) {
+                wrong = wrong ?? @"$(q.symbol): $(e.message)";
+                ssi_down = true;
+            }
+        }
+        try {
+            // Histories first: the prices that follow go into each one's last bar.
+            for (int daily = 1; daily >= 0; daily--) {
+                var missing = yield spark (yahoo, daily == 1, now);
+                if (missing != null) wrong = wrong ?? @"$missing: Yahoo has no data for it";
+            }
+            for (int i = 0; i < exact.length; i++) {
+                var q = exact[i];
+                if (now - q.checked > 12 * 3600) {
+                    int64 from = q.daily.t[q.daily.n - 1] - 12 * 86400;
+                    var tail = yield chart (q.symbol, @"period1=$from&period2=$now&interval=1d");
+                    yield reconcile (q, closes (tail), now);
+                }
+                var bars = yield chart (q.symbol, @"period1=$(bars_from (q, now))&period2=$now&interval=5m");
+                apply (q, bars, now);
+                q.refreshed = now;
+                cache.save (q, now);
+            }
+        } catch (Error e) {
+            wrong = wrong ?? e.message;
+        }
+        return wrong;
     }
 
-    // Fetch the last few days of daily bars and hold them against ours. Normally they agree and any
-    // new days are appended. If a split or a dividend adjustment has rewritten the past, they don't,
-    // and the whole history is downloaded again.
-    async void catch_up (Quote q, int64 now) throws Error {
-        int64 from = q.daily.t[q.daily.n - 1] - 12 * 86400;
-        Series tail;
-        if (from_ssi (q.symbol)) tail = yield ssi_bars (q.symbol, "1D", from); else tail = yield daily_yahoo (q.symbol, from);
+    // Whether spark's figures are too rough for a quote. It rounds prices the way Yahoo's pages print
+    // them, which loses nothing on a share, a fund, an index or a coin, but a currency pair gets four
+    // decimals whatever its size: fine for USD/JPY at 159.3250, no use for JPY/USD at 0.0063 (and
+    // VND/USD comes out as 0). Those are asked about one at a time through chart(), which is exact.
+    static bool coarse (Quote q) { return q.kind == "CURRENCY" && q.price < 100; }
+
+    // One pass over Yahoo's quotes through its "spark" endpoint, which is chart() for up to twenty
+    // symbols in a request and wants no key either. `daily` says which pass: the twice-daily check of
+    // each history, or prices and 5-minute bars. Quotes that need the same reach back share requests,
+    // so that nobody's is bigger than it has to be. Returns a symbol Yahoo no longer answers for, if
+    // there is one; throws if Yahoo can't be had.
+    async string? spark (GenericArray<Quote> quotes, bool daily, int64 now) throws Error {
+        string? missing = null;
+        string[] reach = {};
+        for (int i = 0; i < quotes.length; i++) {
+            var q = quotes[i];
+            string r = "";
+            if (!daily) {
+                // The latest session is all we lack if it is the one we last saw, or if we saw that one
+                // out and at most one more can have begun. Otherwise (a first refresh since launch
+                // included: none of this is kept on disk) the week of 5-minute bars is asked for whole.
+                bool same = now <= q.closes;
+                bool next = q.refreshed >= q.closes && now - q.refreshed < 20 * 3600;
+                r = same || next ? "1d" : "7d";
+            } else if (now - q.checked > 12 * 3600) {
+                int64 gap = now - q.daily.t[q.daily.n - 1];
+                r = "1y";   // away longer than that and nothing overlaps: reconcile() starts over
+                if (gap < 80 * 86400) r = "3mo";
+                if (gap < 20 * 86400) r = "1mo";
+            }
+            reach += r;
+        }
+        var interval = daily ? "1d" : "5m";
+        foreach (unowned string r in REACHES) {
+            var group = new GenericArray<Quote> ();
+            for (int i = 0; i < quotes.length; i++) if (reach[i] == r) group.add (quotes[i]);
+            for (int at = 0; at < group.length; at += BATCH) {
+                int end = int.min (at + BATCH, group.length);
+                string[] symbols = {};
+                for (int i = at; i < end; i++) symbols += group[i].symbol;
+                var root = yield get_json (@"$YAHOO/v7/finance/spark?symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))&range=$r&interval=$interval");
+                var body = root.has_member ("spark") ? root.get_object_member ("spark") : null;
+                if (body == null) throw new IOError.FAILED ("unexpected answer from Yahoo");
+                var results = body.has_member ("result") && !body.get_null_member ("result") ? body.get_array_member ("result") : null;
+                if (results == null) {
+                    // "Not Found" is a request none of whose symbols Yahoo knows: they are all
+                    // missing, and the round goes on. Any other refusal ends it.
+                    var refusal = body.has_member ("error") && !body.get_null_member ("error") ? body.get_object_member ("error") : null;
+                    if (refusal == null || refusal.get_string_member_with_default ("code", "") != "Not Found")
+                        throw new IOError.FAILED ("Yahoo: %s", refusal != null ? refusal.get_string_member_with_default ("description", "unexpected answer") : "unexpected answer");
+                }
+                var answers = new HashTable<string, Json.Object> (str_hash, str_equal);
+                for (uint k = 0; results != null && k < results.get_length (); k++) {
+                    var o = results.get_object_element (k);
+                    if (o.has_member ("response") && o.get_array_member ("response").get_length () > 0)
+                        answers[o.get_string_member_with_default ("symbol", "")] = o.get_array_member ("response").get_object_element (0);
+                }
+                for (int i = at; i < end; i++) {
+                    var q = group[i];
+                    var result = answers[q.symbol];
+                    if (result == null) {
+                        missing = missing ?? q.symbol;   // delisted, or renamed: Yahoo just leaves it out
+                        continue;
+                    }
+                    if (daily) {
+                        var tail = yield with_past (q.symbol, closes (result), q.daily.t[q.daily.n - 1] - 12 * 86400, q.gmtoffset);
+                        yield reconcile (q, tail, now);
+                    } else {
+                        apply (q, result, now);
+                        q.refreshed = now;
+                    }
+                    cache.save (q, now);
+                }
+            }
+        }
+        return missing;
+    }
+
+    // Hold a fresh stretch of daily bars against ours. Normally they agree and any new days are
+    // appended. If a split or a dividend adjustment has rewritten the past, they don't, and the whole
+    // history is downloaded again.
+    async void reconcile (Quote q, Series tail, int64 now) throws Error {
         if (q.daily.agrees (tail, q.gmtoffset)) {
             q.daily.merge (tail);
         } else {
@@ -439,6 +562,7 @@ public class Feed {
     // Fill in the statistics of several quotes at once (day's range, market cap, P/E, dividend, trading
     // outside hours...): one request, whatever their number. Quotes Yahoo doesn't know keep what they had.
     public async void load_stats (GenericArray<Quote> quotes) {
+        var now = get_real_time () / 1000000;
         string[] symbols = {};
         for (int i = 0; i < quotes.length; i++) {
             // Not Vietnam's indices: Yahoo answers for them, but out of a single day of history (a
@@ -463,6 +587,13 @@ public class Feed {
                 s.eps = o.get_double_member_with_default ("epsTrailingTwelveMonths", double.NAN);
                 s.high52 = o.get_double_member_with_default ("fiftyTwoWeekHigh", double.NAN);
                 s.low52 = o.get_double_member_with_default ("fiftyTwoWeekLow", double.NAN);
+                // Yahoo works that range out of whatever history it has, which for some indices is a
+                // week (^SPXXAI). A real one holds every close of the year; one that doesn't is dropped,
+                // and the card works it out from our bars instead. Not SSI's bars, which are adjusted
+                // for dividends where Yahoo's range isn't.
+                double low, high;
+                Quote.extremes (quotes[k].daily, now - 360 * 86400, out low, out high);
+                if (!from_ssi (quotes[k].symbol) && (s.low52 > low * 1.001 || s.high52 < high * 0.999)) s.low52 = s.high52 = double.NAN;
                 s.dividend_yield = o.get_double_member_with_default ("dividendYield", double.NAN);
                 s.dividend_rate = o.get_double_member_with_default ("dividendRate", o.get_double_member_with_default ("trailingAnnualDividendRate", double.NAN));
                 s.state = o.get_string_member_with_default ("marketState", "");
@@ -679,7 +810,8 @@ public class Feed {
         var now = get_real_time () / 1000000;
         // Everything, by dates: range=max silently returns 3-month bars instead. 36,000 days because
         // Yahoo refuses more than 100 years of daily bars for some symbols (^VNINDEX.VN).
-        var result = yield chart (symbol, @"period1=$(now - 36000 * (int64) 86400)&period2=$now&interval=1d");
+        int64 from = now - 36000 * (int64) 86400;
+        var result = yield chart (symbol, @"period1=$from&period2=$now&interval=1d");
         var meta = result.get_object_member ("meta");
         var q = new Quote () {
             symbol = symbol,
@@ -689,20 +821,46 @@ public class Feed {
             daily = closes (result)
         };
         q.name = meta.get_string_member_with_default ("longName", meta.get_string_member_with_default ("shortName", symbol));
+        q.daily = yield with_past (symbol, q.daily, from, q.gmtoffset);
         if (q.daily.n == 0) throw new IOError.FAILED ("no price history");
-        yield refresh_yahoo (q);
+        apply (q, yield chart (symbol, @"period1=$(bars_from (q, now))&period2=$now&interval=5m"), now);
         return q;
     }
 
-    async Series daily_yahoo (string symbol, int64 from) throws Error {
-        var now = get_real_time () / 1000000;
-        var result = yield chart (symbol, @"period1=$from&period2=$now&interval=1d");
-        return closes (result);
+    // Some indices Yahoo carries with no past at all, only today's level: ^SPXXAI, which S&P launched
+    // in 2026, has a single daily bar there. CNBC has such an index's closes (that one's back to 2000,
+    // back-tested), so when Yahoo comes up with one bar or none, the days before it are CNBC's.
+    // Nothing else is asked of CNBC. Its US prices match Yahoo's, but it has no Vietnam, quotes Asia
+    // late, and its bars come one symbol to a request.
+    // ponytail: indices only (^X is .X there). A share would need CNBC's naming for its market
+    // (7203.T-JP, 700-HK); none has turned up that Yahoo lacks the history of.
+    async Series with_past (string symbol, Series daily, int64 from, int gmtoffset) {
+        if (daily.n > 1 || !symbol.has_prefix ("^")) return daily;
+        var all = new Series ();
+        try {
+            // Asked for bars from before 1970, CNBC dates every one of them a day early.
+            var since = new DateTime.from_unix_utc (int64.max (from, 86400)).format ("%Y%m%d000000");
+            var until = new DateTime.now_utc ().add_days (1).format ("%Y%m%d000000");
+            var root = yield get_json (@"$CNBC_BARS/.$(Uri.escape_string (symbol.substring (1)))/1D/$since/$until/adjusted/EST5EDT.json");
+            var data = root.has_member ("barData") && !root.get_null_member ("barData") ? root.get_object_member ("barData") : null;
+            var bars = data != null && data.has_member ("priceBars") && !data.get_null_member ("priceBars") ? data.get_array_member ("priceBars") : null;
+            int64 first = daily.n > 0 ? (daily.t[0] + gmtoffset) / 86400 : int64.MAX;   // Yahoo's own bars start here
+            for (uint i = 0; bars != null && i < bars.get_length (); i++) {
+                var bar = bars.get_object_element (i);
+                var day = bar.get_string_member_with_default ("tradeTime", "");   // "20260220000000"
+                double close = double.parse (bar.get_string_member_with_default ("close", ""));
+                if (day.length < 8 || close <= 0) continue;
+                // CNBC dates its bars where Yahoo times them: call it noon on the exchange's clock.
+                int64 t = new DateTime.utc (int.parse (day.substring (0, 4)), int.parse (day.substring (4, 2)), int.parse (day.substring (6, 2)), 12, 0, 0).to_unix () - gmtoffset;
+                if ((t + gmtoffset) / 86400 < first) all.add (t, close);
+            }
+        } catch (Error e) {}   // no help from CNBC: what Yahoo has will have to do
+        for (int i = 0; i < daily.n; i++) all.add (daily.t[i], daily.v[i]);
+        return all;
     }
 
-    async void refresh_yahoo (Quote q) throws Error {
-        var now = get_real_time () / 1000000;
-        var result = yield chart (q.symbol, @"period1=$(bars_from (q, now))&period2=$now&interval=5m");
+    // Take a quote's price, session hours and newest 5-minute bars from a chart of it.
+    static void apply (Quote q, Json.Object result, int64 now) {
         var meta = result.get_object_member ("meta");
         q.intra.merge (closes (result));   // nothing new while the market is shut
         if (meta.has_member ("currentTradingPeriod") && meta.get_object_member ("currentTradingPeriod").has_member ("regular")) {
