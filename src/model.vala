@@ -109,10 +109,11 @@ public class Quote {
     static double scale (double v, double rate, bool invert) { return invert ? v / rate : v * rate; }
 }
 
-// A theoretical purchase. GObject properties so json-glib can (de)serialize it and a ColumnView can list it.
+// A tracked stock: a theoretical purchase, or with no shares just one to watch.
+// GObject properties so json-glib can (de)serialize it and a ColumnView can list it.
 public class Lot : Object {
     public string symbol { get; set; default = ""; }
-    public double shares { get; set; }
+    public double shares { get; set; }                // 0 = watched only: date and price mean nothing
     public double price { get; set; }                // paid per share, in the instrument's own currency
     public string date { get; set; default = ""; }   // YYYY-MM-DD
 
@@ -123,11 +124,12 @@ public class Lot : Object {
     }
 }
 
-// A treemap cell: one held symbol, sized by value.
+// A treemap cell: one tracked symbol.
 public class Tile {
     public string symbol;
     public string name;
-    public double value;    // in the portfolio currency
+    public double value;    // held, in the portfolio currency; 0 if only watched
+    public double weight;   // what sizes the tile: value, or a stand-in for watched symbols
     public double change;   // the instrument's own price change over the range
     public double x;
     public double y;
@@ -145,7 +147,7 @@ public class Portfolio {
 
     static string? usd_pair (string cur) { return cur == "USD" ? null : cur + "USD=X"; }
 
-    // Symbols to keep fresh: holdings, plus the FX pairs that bring them into our currency.
+    // Symbols to keep fresh: everything tracked, plus the FX pairs that bring holdings into our currency.
     public string[] wanted () {
         string[] symbols = {};
         var seen = new GenericSet<string> (str_hash, str_equal);
@@ -153,7 +155,7 @@ public class Portfolio {
             var l = (Lot) lots.get_item (i);
             var q = quotes[l.symbol];
             string?[] need = { l.symbol, null, null };
-            if (q != null && q.currency != "" && q.currency != currency) {
+            if (l.shares > 0 && q != null && q.currency != "" && q.currency != currency) {
                 need[1] = usd_pair (q.currency);
                 need[2] = usd_pair (currency);
             }
@@ -169,7 +171,7 @@ public class Portfolio {
         for (uint i = 0; i < lots.get_n_items (); i++) {
             var l = (Lot) lots.get_item (i);
             Quote? c = quotes[l.symbol];
-            if (c == null || converted.contains (l.symbol)) continue;
+            if (c == null || l.shares <= 0 || converted.contains (l.symbol)) continue;
             if (c.currency != "" && c.currency != currency) {
                 var into_usd = usd_pair (c.currency), from_usd = usd_pair (currency);
                 if (into_usd != null) c = quotes[into_usd] != null ? c.times (quotes[into_usd], false) : null;
@@ -188,12 +190,12 @@ public class Portfolio {
 
     // A lot's gain over a range and the capital that earned it, in our currency: measured from its cost
     // if it was bought within the range, otherwise from the price when the range began.
-    // False (and zeros) while its quote or FX rate hasn't loaded.
+    // False (and zeros) for a watched stock, or while its quote or FX rate hasn't loaded.
     public bool lot_gain (Lot l, Range r, int64 now, out double earned, out double capital) {
         earned = 0;
         capital = 0;
         var c = converted[l.symbol];
-        if (c == null) return false;
+        if (c == null || l.shares <= 0) return false;
         double from = l.ts (c.gmtoffset) >= c.start (r, now) ? cost (l) : c.basis (r, now);
         capital = l.shares * from;
         earned = l.shares * c.price - capital;
@@ -224,7 +226,7 @@ public class Portfolio {
         for (uint i = 0; i < lots.get_n_items (); i++) {
             var l = (Lot) lots.get_item (i);
             var c = converted[l.symbol];
-            if (c == null) continue;
+            if (c == null || l.shares <= 0) continue;
             views += c.view (r, now);
             shares += l.shares;
             basis += c.basis (r, now);
@@ -249,28 +251,34 @@ public class Portfolio {
         return s;
     }
 
-    // One tile per held symbol, biggest first, laid out to fill w x h.
+    // One tile per tracked symbol, biggest first, laid out to fill w x h. Holdings are sized by value;
+    // a watched symbol has none, so it gets the average holding's size (equal sizes if nothing is held).
     public GenericArray<Tile> tiles (Range r, int64 now, double w, double h) {
         var by_symbol = new HashTable<string, Tile> (str_hash, str_equal);
         var list = new GenericArray<Tile> ();
         for (uint i = 0; i < lots.get_n_items (); i++) {
             var l = (Lot) lots.get_item (i);
-            var c = converted[l.symbol];
-            if (c == null) continue;
+            var q = quotes[l.symbol];
+            if (q == null) continue;
             var t = by_symbol[l.symbol];
             if (t == null) {
-                t = new Tile () { symbol = l.symbol, name = c.name, change = quotes[l.symbol].change (r, now) };
+                t = new Tile () { symbol = l.symbol, name = q.name, change = q.change (r, now) };
                 by_symbol[l.symbol] = t;
                 list.add (t);
             }
-            t.value += l.shares * c.price;
+            var c = converted[l.symbol];
+            if (c != null) t.value += l.shares * c.price;
         }
-        list.sort ((a, b) => a.value < b.value ? 1 : (a.value > b.value ? -1 : 0));
+        double total = 0;
+        int held = 0;
+        for (int i = 0; i < list.length; i++) if (list[i].value > 0) { total += list[i].value; held++; }
+        for (int i = 0; i < list.length; i++) list[i].weight = list[i].value > 0 ? list[i].value : (held > 0 ? total / held : 1);
+        list.sort ((a, b) => a.weight < b.weight ? 1 : (a.weight > b.weight ? -1 : strcmp (a.symbol, b.symbol)));
         layout (list, 0, list.length, 0, 0, w, h);
         return list;
     }
 
-    // ponytail: binary split (halve the list by value, cut the longer side). Tiles stay reasonably
+    // ponytail: binary split (halve the list by weight, cut the longer side). Tiles stay reasonably
     // square; switch to a squarified treemap if a long tail of tiny holdings turns into slivers.
     static void layout (GenericArray<Tile> t, int lo, int hi, double x, double y, double w, double h) {
         if (hi - lo < 1) return;
@@ -279,11 +287,11 @@ public class Portfolio {
             return;
         }
         double total = 0;
-        for (int i = lo; i < hi; i++) total += t[i].value;
-        // Take items while that brings the first half closer to half the value.
+        for (int i = lo; i < hi; i++) total += t[i].weight;
+        // Take items while that brings the first half closer to half the weight.
         int mid = lo + 1;
-        double acc = t[lo].value;
-        while (mid < hi - 1 && Math.fabs (acc + t[mid].value - total / 2) < Math.fabs (acc - total / 2)) acc += t[mid++].value;
+        double acc = t[lo].weight;
+        while (mid < hi - 1 && Math.fabs (acc + t[mid].weight - total / 2) < Math.fabs (acc - total / 2)) acc += t[mid++].weight;
         double f = acc / total;
         if (w >= h) {
             layout (t, lo, mid, x, y, w * f, h);

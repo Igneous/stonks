@@ -6,11 +6,15 @@
 //                   terminal also has Hanoi (HNX) and UPCoM, with history back to 2006.
 //                   Drop-in alternatives that returned identical bars when this was written:
 //                   services.entrade.com.vn/chart-api/v2/ohlcs/stock and dchart-api.vndirect.com.vn/dchart/history.
+//
+// Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities.
 namespace Stonks {
 
+// A search result.
 public class Hit {
     public string symbol;
-    public string detail;
+    public string name;     // as full as we can get it: "Alphabet Inc. - Class C Capital Stock"
+    public string detail;   // exchange, type, sector, industry
 }
 
 public class Feed {
@@ -19,6 +23,7 @@ public class Feed {
     const string SSI_INFO = "https://iboard-query.ssi.com.vn/stock";
     // Yahoo answers 429 to user agents that don't look like a browser.
     Soup.Session session = new Soup.Session () { user_agent = "Mozilla/5.0 (X11; Linux x86_64)", timeout = 30 };
+    HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
 
     async Json.Object get_json (string url) throws Error {
         var msg = new Soup.Message ("GET", url);
@@ -56,12 +61,34 @@ public class Feed {
         if (q.symbol.has_suffix (".VN")) yield refresh_ssi (q); else yield refresh_yahoo (q);
     }
 
+    // Full names of US-listed securities, from Nasdaq Trader's symbol directory. Yahoo calls every share
+    // class of a company the same thing ("Alphabet Inc." for GOOG, GOOGL, GOOGM and GOOGN alike); these
+    // say which is which. Two small files, fetched once (the window asks at startup).
+    public async void load_names () {
+        if (names != null) return;
+        var found = new HashTable<string, string> (str_hash, str_equal);
+        foreach (var file in new string[] { "nasdaqlisted", "otherlisted" }) {
+            try {
+                var msg = new Soup.Message ("GET", @"https://www.nasdaqtrader.com/dynamic/symdir/$file.txt");
+                var body = yield session.send_and_read_async (msg, Priority.DEFAULT, null);
+                if (msg.status_code != 200 || body.get_size () == 0) continue;
+                // Lines are Symbol|Security Name|...; class shares are BRK.B there and BRK-B on Yahoo.
+                foreach (var line in ((string) body.get_data ()).substring (0, (long) body.get_size ()).split ("\n")) {
+                    var field = line.split ("|");
+                    if (field.length > 1) found[field[0].replace (".", "-")] = field[1];
+                }
+            } catch (Error e) {}
+        }
+        if (found.size () > 0) names = found;   // else offline: try again next time
+    }
+
     // The exact ticker in Vietnam if there is one (on any of its three boards), then up to five Yahoo
     // matches by name or ticker.
     // ponytail: Vietnamese companies are found by ticker only; searching them by name needs a symbol
     // list (trading.vietcap.com.vn/api/price/symbols/getAll has one) filtered here.
     public async Hit[] search (string text) {
         Hit[] hits = {};
+        yield load_names ();   // normally there already; this retries if we started offline
         var code = text.up ();
         if (code.has_suffix (".VN")) code = code[0:code.length - 3];
         bool plausible = code.length >= 3 && code.length <= 8;
@@ -70,7 +97,8 @@ public class Feed {
             var info = yield ssi_info (code);
             if (info != null) hits += new Hit () {
                 symbol = code + ".VN",
-                detail = "%s · %s · Vietnam".printf (info.get_string_member_with_default ("companyNameEn", code), info.get_string_member_with_default ("exchange", "").up ())
+                name = info.get_string_member_with_default ("companyNameEn", code),
+                detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ())
             };
         }
         try {
@@ -79,10 +107,15 @@ public class Feed {
             for (uint i = 0; i < quotes.get_length (); i++) {
                 var o = quotes.get_object_element (i);
                 if (!o.has_member ("symbol") || o.get_string_member ("symbol") == code + ".VN") continue;   // already listed above
-                var name = o.get_string_member_with_default ("longname", o.get_string_member_with_default ("shortname", ""));
+                var symbol = o.get_string_member ("symbol");
+                string? full = names != null ? names[symbol] : null;
+                string[] facts = {};
+                foreach (var key in new string[] { "exchDisp", "typeDisp", "sectorDisp", "industryDisp" })
+                    if (o.get_string_member_with_default (key, "") != "") facts += o.get_string_member (key);
                 hits += new Hit () {
-                    symbol = o.get_string_member ("symbol"),
-                    detail = "%s · %s · %s".printf (name, o.get_string_member_with_default ("exchDisp", ""), o.get_string_member_with_default ("typeDisp", ""))
+                    symbol = symbol,
+                    name = full ?? o.get_string_member_with_default ("longname", o.get_string_member_with_default ("shortname", symbol)),
+                    detail = string.joinv (" · ", facts)
                 };
             }
         } catch (Error e) {}

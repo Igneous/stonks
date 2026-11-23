@@ -109,5 +109,31 @@ void main () {
     near (area, 400 * 300);
     near (tiles[1].w * tiles[1].h, 400 * 300 * 20.0 / (15 * 109 + 20));
 
+    // --- a watched stock (no shares): on the heatmap at an average holding's size, out of every total ---
+    p.quotes["W"] = quote ("W", "EUR", 50, 1);
+    p.lots.append (new Lot () { symbol = "W" });
+    assert (string.joinv (" ", p.wanted ()) == "A J JPYUSD=X W");   // and no EURUSD=X just to watch it
+    p.rebase ();
+    p.gain (Range.MAX, NOW, out gain, out capital);
+    near (capital, 10 * 90 + 5 * 104 + 10);
+    assert (!p.lot_gain ((Lot) p.lots.get_item (3), Range.MAX, NOW, out g, out k));
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    assert (tiles.length == 3 && tiles[1].symbol == "W" && tiles[1].value == 0);
+    near (tiles[1].weight, (15 * 109 + 20) / 2.0);
+    near (tiles[1].change, 59.0 / 58 - 1);
+    near (tiles[1].w * tiles[1].h, 400 * 300 * 827.5 / (15 * 109 + 20 + 827.5));
+
+    // nothing held at all: a plain watchlist gets equal tiles
+    var watch = new Portfolio ();
+    watch.quotes["A"] = a;
+    watch.quotes["W"] = p.quotes["W"];
+    watch.lots.append (new Lot () { symbol = "W" });
+    watch.lots.append (new Lot () { symbol = "A" });
+    watch.rebase ();
+    tiles = watch.tiles (Range.D1, NOW, 400, 300);
+    assert (tiles.length == 2 && tiles[0].symbol == "A");
+    near (tiles[0].w * tiles[0].h, tiles[1].w * tiles[1].h);
+    assert (watch.history (Range.D7, NOW, out opening).n == 0);
+
     print ("ok\n");
 }

@@ -1,4 +1,4 @@
-// The window: holdings table and chart, the two heatmap pages, and the add-position dialog.
+// The window: the table of tracked stocks and its chart, the two heatmap pages, and the add-stock dialog.
 namespace Stonks {
 
 const string APP_ID = "io.github.igneous.Stonks";
@@ -14,6 +14,7 @@ public class Window : Adw.ApplicationWindow {
     Range range = Range.D1;
     string path = Path.build_filename (Environment.get_user_data_dir (), "stonks", "portfolio.json");
     GenericSet<string> loading = new GenericSet<string> (str_hash, str_equal);
+    GenericSet<string> peeking = new GenericSet<string> (str_hash, str_equal);   // see peek()
     string updated = "";
     bool round_failed;   // a fetch failed since quotes last settled
     bool failing;        // ...and so did the round before: the outage has been announced already
@@ -22,6 +23,7 @@ public class Window : Adw.ApplicationWindow {
     Adw.ToastOverlay toasts = new Adw.ToastOverlay ();
     Gtk.Stack stack = new Gtk.Stack ();
     Gtk.Label status = new Gtk.Label ("") { css_classes = { "dim-label", "caption" } };
+    Gtk.Box stats = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 40) { margin_start = 18, margin_end = 18, margin_top = 4 };
     Gtk.Label value_lbl;
     Gtk.Label day_lbl;
     Gtk.Label total_lbl;
@@ -44,7 +46,7 @@ public class Window : Adw.ApplicationWindow {
         // Header bar: add, page switcher, totals currency, refresh.
         var pages = new Adw.ViewStack ();
         var header = new Adw.HeaderBar () { title_widget = new Adw.ViewSwitcher () { stack = pages, policy = Adw.ViewSwitcherPolicy.WIDE } };
-        header.pack_start (new Gtk.Button.from_icon_name ("list-add-symbolic") { action_name = "win.add", tooltip_text = "Add position (Ctrl+N)" });
+        header.pack_start (new Gtk.Button.from_icon_name ("list-add-symbolic") { action_name = "win.add", tooltip_text = "Add stock (Ctrl+N)" });
         header.pack_end (new Gtk.Button.from_icon_name ("view-refresh-symbolic") { action_name = "win.refresh", tooltip_text = "Refresh (Ctrl+R)" });
         var currency = new Gtk.DropDown.from_strings (CURRENCIES) { tooltip_text = "Currency for totals" };
         for (uint i = 0; i < CURRENCIES.length; i++) if (CURRENCIES[i] == p.currency) currency.selected = i;
@@ -63,8 +65,7 @@ public class Window : Adw.ApplicationWindow {
         ranges.notify["active"].connect (() => { range = (Range) ranges.active; update (); });
         var bar = new Gtk.CenterBox () { center_widget = ranges, end_widget = status, margin_start = 12, margin_end = 12, margin_bottom = 8 };
 
-        // Holdings page: headline numbers, chart, table.
-        var stats = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 40) { margin_start = 18, margin_end = 18, margin_top = 4 };
+        // Stocks page: headline numbers (when something is held), chart, table.
         value_lbl = stat (stats, "Value");
         day_lbl = stat (stats, "Day");
         total_lbl = stat (stats, "Total gain");
@@ -89,23 +90,23 @@ public class Window : Adw.ApplicationWindow {
         selection.notify["selected-item"].connect (() => update ());   // a selected row charts that symbol
         view.model = selection;
 
-        var holdings = new Gtk.Box (Gtk.Orientation.VERTICAL, 0);
-        holdings.append (stats);
-        holdings.append (chart_head);
-        holdings.append (chart);
-        holdings.append (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
-        holdings.append (new Gtk.ScrolledWindow () { child = view, vexpand = true });
+        var stocks = new Gtk.Box (Gtk.Orientation.VERTICAL, 0);
+        stocks.append (stats);
+        stocks.append (chart_head);
+        stocks.append (chart);
+        stocks.append (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
+        stocks.append (new Gtk.ScrolledWindow () { child = view, vexpand = true });
 
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         matrix = new Matrix (p) { margin_start = 12, margin_end = 12, margin_bottom = 12, valign = Gtk.Align.START };
-        pages.add_titled_with_icon (holdings, "holdings", "Holdings", "view-list-symbolic");
+        pages.add_titled_with_icon (stocks, "stocks", "Stocks", "view-list-symbolic");
         pages.add_titled_with_icon (treemap, "heatmap", "Heatmap", "view-grid-symbolic");
         pages.add_titled_with_icon (new Gtk.ScrolledWindow () { child = matrix }, "performance", "Performance", "power-profile-performance-symbolic");
 
         var empty = new Adw.StatusPage () {
-            title = "No positions yet",
-            description = "Add a ticker, a share count and a buy date to see what that investment would be worth today.",
-            child = new Gtk.Button.with_label ("Add position") { action_name = "win.add", halign = Gtk.Align.CENTER, css_classes = { "pill", "suggested-action" } }
+            title = "No stocks yet",
+            description = "Add a stock to follow its price. Give it a share count and a buy date to see what that investment would be worth today.",
+            child = new Gtk.Button.with_label ("Add stock") { action_name = "win.add", halign = Gtk.Align.CENTER, css_classes = { "pill", "suggested-action" } }
         };
         stack.add_named (empty, "empty");
         stack.add_named (pages, "main");
@@ -132,6 +133,7 @@ public class Window : Adw.ApplicationWindow {
 
         update ();
         sync (true);
+        feed.load_names.begin ();
         // ponytail: one request per symbol every two minutes. Yahoo publishes no limit for these
         // endpoints; lengthen this if a large portfolio starts drawing HTTP 429.
         Timeout.add_seconds (120, () => { sync (true); return Source.CONTINUE; });
@@ -159,7 +161,7 @@ public class Window : Adw.ApplicationWindow {
         tint (label, capital > 0 ? gain : 0);
     }
 
-    // ---- holdings table ----
+    // ---- stocks table ----
 
     // ponytail: one row per lot. Two buys of the same symbol are two rows (the heatmaps merge them);
     // group rows by symbol here if that gets noisy.
@@ -198,21 +200,24 @@ public class Window : Adw.ApplicationWindow {
 
     // A cell's text, plus its number for sorting and coloring (NaN for text and not-yet-loaded cells).
     // Cost, Price and Change are the instrument's own; Value, Gain and Annual are in the totals currency.
+    // A watched stock (no shares) leaves everything about a position blank.
     string cell_text (Lot l, int col, out double key) {
         key = double.NAN;
         var now = now_s ();
         var q = p.quotes[l.symbol];
         var own = q != null ? q.currency : "";
+        bool held = l.shares > 0;
         switch (col) {
         case 0: return l.symbol;
         case 1: return q != null ? q.name : "";
-        case 2: key = l.shares; return "%.8g".printf (l.shares);
-        case 3: return l.date;
-        case 4: key = l.price; return money (l.price, own);
+        case 2: if (held) key = l.shares; return held ? "%.8g".printf (l.shares) : "";
+        case 3: return held ? l.date : "";
+        case 4: if (held) key = l.price; return held ? money (l.price, own) : "";
         case 5: if (q != null) key = q.price; return money (key, own);
         case 6: return own;
         case COL_CHANGE: if (q != null) key = q.change (range, now); return pct (key);
         }
+        if (!held) return "";
         double gain, capital;
         if (!p.lot_gain (l, Range.MAX, now, out gain, out capital)) return "—";
         switch (col) {
@@ -234,6 +239,13 @@ public class Window : Adw.ApplicationWindow {
         stack.visible_child_name = p.lots.get_n_items () == 0 ? "empty" : "main";
         status.label = loading.length > 0 ? "Updating…" : updated;
 
+        // With nothing held there is no portfolio to total or chart: hide the totals and chart a stock.
+        bool held = false;
+        for (uint i = 0; i < p.lots.get_n_items (); i++) held |= ((Lot) p.lots.get_item (i)).shares > 0;
+        stats.visible = held;
+        foreach (int col in new int[] { 2, 3, 4, COL_VALUE, COL_GAIN, COL_GAIN + 1 }) columns[col].visible = held;   // the position columns
+        if (!held && selection.selected_item == null && selection.get_n_items () > 0) selection.selected = 0;
+
         double day, day_capital, total, cost, moved, moved_capital;
         p.gain (Range.D1, now, out day, out day_capital);
         p.gain (Range.MAX, now, out total, out cost);
@@ -245,7 +257,7 @@ public class Window : Adw.ApplicationWindow {
 
         var lot = selection.selected_item as Lot;
         var q = lot != null ? p.quotes[lot.symbol] : null;
-        back.visible = lot != null;
+        back.visible = lot != null && held;
         if (q != null) {
             double basis = q.basis (range, now);
             chart_title.label = "%s · %s · %s %s".printf (q.symbol, q.name, money (q.price, q.currency), q.currency);
@@ -324,31 +336,47 @@ public class Window : Adw.ApplicationWindow {
         toasts.add_toast (error_toast);
     }
 
-    // ---- adding and removing lots ----
+    // ---- adding and removing stocks ----
 
     void add_dialog (Lot? draft) {
         var symbol = new Adw.EntryRow () { title = "Symbol or company name", activates_default = true };
         var shares = new Adw.EntryRow () { title = "Shares", activates_default = true };
         var date = new Adw.EntryRow () { title = "Buy date (YYYY-MM-DD)", activates_default = true };
-        var price = new Adw.EntryRow () { title = "Price per share (optional)", activates_default = true };
-        var hits = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" }, visible = false };
-        var top = new Adw.PreferencesGroup ();
-        top.add (symbol);
-        var rest = new Adw.PreferencesGroup ();
-        rest.add (shares);
-        rest.add (date);
-        rest.add (price);
-        var form = new Gtk.Box (Gtk.Orientation.VERTICAL, 12);
-        form.append (top);
-        form.append (hits);
-        form.append (rest);
+        var price = new Adw.EntryRow () { title = "Price per share", activates_default = true };
+        var calendar = new Gtk.Calendar ();
+        calendar.day_selected.connect (() => { date.text = calendar.get_date ().format ("%Y-%m-%d"); });
+        date.add_suffix (new Gtk.MenuButton () {
+            icon_name = "x-office-calendar-symbolic", tooltip_text = "Pick a date", valign = Gtk.Align.CENTER,
+            css_classes = { "flat" }, popover = new Gtk.Popover () { child = calendar }
+        });
+        var hits = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" }, visible = false, margin_top = 12 };
 
-        var dialog = new Adw.AlertDialog ("Add position", "Search by name or ticker: AAPL, 7203.T, 005930.KS, 600519.SS, or PVS.VN for any Vietnamese exchange. Leave the price empty to use that day's close.") {
-            extra_child = form, default_response = "add", close_response = "cancel", prefer_wide_layout = true
+        var stock = new Adw.PreferencesGroup () {
+            title = "Stock",
+            description = "Search by name or ticker: AAPL, 7203.T, 005930.KS, 600519.SS, or PVS.VN for any Vietnamese exchange."
         };
-        dialog.add_response ("cancel", "Cancel");
-        dialog.add_response ("add", "Add");
-        dialog.set_response_appearance ("add", Adw.ResponseAppearance.SUGGESTED);
+        stock.add (symbol);
+        stock.add (hits);
+        var position = new Adw.PreferencesGroup () {
+            title = "Position",
+            description = "Optional. Leave Shares empty to just follow the stock."
+        };
+        position.add (shares);
+        position.add (date);
+        position.add (price);
+        var form = new Gtk.Box (Gtk.Orientation.VERTICAL, 24) { margin_top = 12, margin_bottom = 24, margin_start = 24, margin_end = 24 };
+        form.append (stock);
+        form.append (position);
+
+        var add = new Gtk.Button.with_label ("Add") { css_classes = { "suggested-action" }, sensitive = false };
+        var cancel = new Gtk.Button.with_label ("Cancel");
+        var bar = new Adw.HeaderBar () { show_start_title_buttons = false, show_end_title_buttons = false };
+        bar.pack_start (cancel);
+        bar.pack_end (add);
+        var body = new Adw.ToolbarView () { content = new Gtk.ScrolledWindow () { child = form, hscrollbar_policy = Gtk.PolicyType.NEVER } };
+        body.add_top_bar (bar);
+        // A fixed size: wide enough for a security's full name, and no jumping about as results come and go.
+        var dialog = new Adw.Dialog () { title = "Add stock", content_width = 760, content_height = 660, child = body, default_widget = add };
 
         // Symbol search as you type; `serial` drops answers to anything but the latest keystroke.
         uint serial = 0;
@@ -356,6 +384,9 @@ public class Window : Adw.ApplicationWindow {
         symbol.changed.connect (() => {
             uint mine = ++serial;
             var text = symbol.text.strip ();
+            // A different stock: the price filled in for the last one no longer applies.
+            if (price.text != "" && price.text == price.get_data<string> ("auto")) price.text = "";
+            price.title = "Price per share";
             if (text == picked || text.length < 2) {
                 hits.visible = false;
                 return;
@@ -366,7 +397,7 @@ public class Window : Adw.ApplicationWindow {
                     if (mine != serial) return;
                     hits.remove_all ();
                     foreach (var hit in found)
-                        hits.append (new Adw.ActionRow () { title = hit.symbol, subtitle = hit.detail, use_markup = false, activatable = true });
+                        hits.append (new Adw.ActionRow () { use_markup = false, title = hit.symbol, subtitle = hit.name + "\n" + hit.detail, activatable = true });
                     hits.visible = found.length > 0;
                 });
                 return Source.REMOVE;
@@ -376,38 +407,74 @@ public class Window : Adw.ApplicationWindow {
             picked = ((Adw.ActionRow) row).title;
             symbol.text = picked;
             shares.grab_focus ();
+            autofill (symbol, date, price);
         });
+        shares.changed.connect (() => autofill (symbol, date, price));
+        date.changed.connect (() => autofill (symbol, date, price));
 
         // Add stays disabled until the form parses; `lot` always holds the latest valid reading.
+        // No shares means a stock to watch, so the rest of the position is switched off and ignored.
         var lot = new Lot ();
         Adw.EntryRow[] rows = { symbol, shares, date, price };
         foreach (var row in rows) row.changed.connect (() => {
             double n = 0, cost = 0;
             string s = symbol.text.strip ().up (), d = date.text.strip (), c = price.text.strip ();
+            bool watching = shares.text.strip () == "";
             var day = new DateTime.from_iso8601 (d + "T00:00:00Z", null);
-            bool n_ok = double.try_parse (shares.text.strip (), out n) && n > 0 && n.is_finite ();
-            bool d_ok = d.length == 10 && day != null && day.compare (new DateTime.now_utc ().add_days (1)) < 0;
-            bool c_ok = c == "" || (double.try_parse (c, out cost) && cost > 0 && cost.is_finite ());
-            mark (shares, n_ok || shares.text == "");
+            bool n_ok = watching || (double.try_parse (shares.text.strip (), out n) && n > 0 && n.is_finite ());
+            bool d_ok = watching || (d.length == 10 && day != null && day.compare (new DateTime.now_utc ().add_days (1)) < 0);
+            bool c_ok = watching || c == "" || (double.try_parse (c, out cost) && cost > 0 && cost.is_finite ());
+            mark (shares, n_ok);
             mark (date, d_ok);
             mark (price, c_ok);
-            dialog.set_response_enabled ("add", s != "" && n_ok && d_ok && c_ok);
+            date.sensitive = price.sensitive = !watching;
+            add.sensitive = s != "" && n_ok && d_ok && c_ok;
             lot.symbol = s;
-            lot.shares = n;
-            lot.date = d;
-            lot.price = cost;
+            lot.shares = watching ? 0 : n;
+            lot.date = watching ? "" : d;
+            lot.price = watching ? 0 : cost;
         });
-        date.text = draft != null ? draft.date : new DateTime.now_local ().format ("%Y-%m-%d");
-        if (draft != null) {
-            shares.text = "%.8g".printf (draft.shares);
-            symbol.text = draft.symbol;
-        }
-        dialog.response.connect ((id) => { if (id == "add") add_lot.begin (lot); });
+        if (draft != null) symbol.text = draft.symbol;
+        date.text = draft != null && draft.shares > 0 ? draft.date : new DateTime.now_local ().format ("%Y-%m-%d");
+        if (draft != null && draft.shares > 0) shares.text = "%.8g".printf (draft.shares);
+        cancel.clicked.connect (() => { dialog.close (); });
+        add.clicked.connect (() => {
+            dialog.close ();
+            add_lot.begin (lot);
+        });
         dialog.present (this);
     }
 
     void mark (Adw.EntryRow row, bool ok) {
         if (ok) row.remove_css_class ("error"); else row.add_css_class ("error");
+    }
+
+    // The quote for a symbol still being filled in on the form: the one we have, or fetched without
+    // complaint if that fails (Add will say why). Null while another peek for it is on its way.
+    async Quote? peek (string symbol) {
+        if (p.quotes.contains (symbol) || peeking.contains (symbol)) return p.quotes[symbol];
+        peeking.add (symbol);
+        try { p.quotes[symbol] = yield feed.fetch (symbol); } catch (Error e) {}
+        peeking.remove (symbol);
+        return p.quotes[symbol];
+    }
+
+    // Put the close on the buy date into the price row, unless the user has typed a price of their own.
+    // The row remembers what was filled in ("auto") so a later date change can replace it.
+    void autofill (Adw.EntryRow symbol, Adw.EntryRow date, Adw.EntryRow price) {
+        var asked = symbol.text.strip ().up ();
+        if (asked == "") return;
+        peek.begin (asked, (obj, res) => {
+            var q = peek.end (res);
+            var day = new DateTime.from_iso8601 (date.text.strip () + "T00:00:00Z", null);
+            // Read the form now, not when we asked: it may have moved on while the quote loaded.
+            if (q == null || day == null || date.text.strip ().length != 10 || symbol.text.strip ().up () != asked) return;
+            if (price.text != "" && price.text != price.get_data<string> ("auto")) return;
+            var close = "%.8g".printf (q.daily.v[q.bar (day.to_unix () - q.gmtoffset)]);
+            price.set_data<string> ("auto", close);
+            price.text = close;
+            price.title = @"Price per share ($(q.currency))";
+        });
     }
 
     async void add_lot (Lot lot) {
@@ -417,7 +484,21 @@ public class Window : Adw.ApplicationWindow {
             add_dialog (lot);   // load_symbol already said why; let them fix the symbol
             return;
         }
-        if (lot.price <= 0) lot.price = q.daily.v[q.bar (lot.ts (q.gmtoffset))];
+        // A stock is listed once unless it's bought more than once: a purchase takes over the stock's
+        // watch-only row, and watching something already listed changes nothing.
+        for (uint i = 0; i < p.lots.get_n_items (); i++) {
+            var other = (Lot) p.lots.get_item (i);
+            if (other.symbol != lot.symbol) continue;
+            if (lot.shares <= 0) {
+                toasts.add_toast (new Adw.Toast (@"$(lot.symbol) is already listed"));
+                return;
+            }
+            if (other.shares <= 0) {
+                p.lots.remove (i);
+                break;
+            }
+        }
+        if (lot.shares > 0 && lot.price <= 0) lot.price = q.daily.v[q.bar (lot.ts (q.gmtoffset))];
         p.lots.append (lot);
         save ();
         sync ();
@@ -477,7 +558,9 @@ public class Window : Adw.ApplicationWindow {
 }
 
 int main (string[] args) {
-    var app = new Adw.Application (APP_ID, ApplicationFlags.DEFAULT_FLAGS);
+    // A screenshot run (dev aid, see the Makefile) must not just raise the copy the user has open.
+    bool shot = Environment.get_variable ("STONKS_SHOT") != null;
+    var app = new Adw.Application (APP_ID, shot ? ApplicationFlags.NON_UNIQUE : ApplicationFlags.DEFAULT_FLAGS);
     app.activate.connect (() => {
         var window = app.active_window ?? new Window (app);
         window.present ();

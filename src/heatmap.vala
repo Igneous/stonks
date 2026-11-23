@@ -26,7 +26,8 @@ public class Treemap : Gtk.DrawingArea {
             for (int i = 0; i < tiles.length; i++) {
                 var t = tiles[i];
                 if (x < t.x || x >= t.x + t.w || y < t.y || y >= t.y + t.h) continue;
-                tip.set_text ("%s · %s\n%s %s · %s over %s".printf (t.symbol, t.name, money (t.value, p.currency), p.currency, pct (t.change), RANGE_LABELS[range]));
+                var worth = t.value > 0 ? "%s %s".printf (money (t.value, p.currency), p.currency) : "Watching";
+                tip.set_text ("%s · %s\n%s · %s over %s".printf (t.symbol, t.name, worth, pct (t.change), RANGE_LABELS[range]));
                 tip.set_tip_area ({ (int) t.x, (int) t.y, (int) t.w, (int) t.h });
                 return true;
             }
@@ -36,11 +37,22 @@ public class Treemap : Gtk.DrawingArea {
 
     void paint (Gtk.DrawingArea area, Cairo.Context cr, int width, int height) {
         tiles = p.tiles (range, now_s (), width, height);
+        bool any_held = false;
+        for (int i = 0; i < tiles.length; i++) any_held |= tiles[i].value > 0;
         for (int i = 0; i < tiles.length; i++) {
             var t = tiles[i];
             heat (cr, t.change, range);
             cr.rectangle (t.x + 1, t.y + 1, t.w - 2, t.h - 2);
             cr.fill ();
+            if (any_held && t.value <= 0) {
+                // Watched next to real holdings: a dashed outline says this tile's size isn't money.
+                cr.set_source_rgba (1, 1, 1, 0.55);
+                cr.set_line_width (1.5);
+                cr.set_dash ({ 5, 4 }, 0);
+                cr.rectangle (t.x + 6, t.y + 6, t.w - 12, t.h - 12);
+                cr.stroke ();
+                cr.set_dash (null, 0);
+            }
             // Text scales with the tile; show as much as fits.
             double size = double.min (t.w / 8, t.h / 4).clamp (7, 26);
             var head = "<span font_desc='Bold %.0f'>%s</span>".printf (size, Markup.escape_text (t.symbol));
@@ -63,7 +75,7 @@ public class Matrix : Gtk.DrawingArea {
         set_draw_func (paint);
     }
 
-    // Held symbols, biggest first (the treemap's tiles, layout ignored).
+    // Tracked symbols, biggest first (the treemap's tiles, layout ignored).
     public void refresh () {
         content_height = ROW * (p.tiles (Range.D1, now_s (), 1, 1).length + 2);
         queue_draw ();
@@ -79,9 +91,12 @@ public class Matrix : Gtk.DrawingArea {
         for (int c = 0; c < RANGE_LABELS.length; c++)
             draw_text (this, cr, RANGE_LABELS[c], label_w + cell_w * (c + 0.5), ROW / 2.0, 0.5, 0.5);
 
-        // Row 0 is the whole portfolio, in its currency; the rest are each instrument's own price change.
-        for (int row = 0; row <= tiles.length; row++) {
-            double y = ROW * (row + 1);
+        // Row 0 is the whole portfolio, in its currency (skipped when nothing is held); the rest are
+        // each instrument's own price change.
+        int first = 1;
+        for (int i = 0; i < tiles.length; i++) if (tiles[i].value > 0) first = 0;
+        for (int row = first; row <= tiles.length; row++) {
+            double y = ROW * (row + 1 - first);
             var t = row > 0 ? tiles[row - 1] : null;
             var label = t != null ? "<b>%s</b>  <span alpha='60%%'>%s</span>".printf (Markup.escape_text (t.symbol), Markup.escape_text (t.name)) : "<b>Portfolio</b>";
             cr.set_source_rgba (fg.red, fg.green, fg.blue, 1);
