@@ -8,12 +8,17 @@ string delta (double v, string currency) { return v.is_finite () ? "%+'.*f".prin
 string pct (double f) { return f.is_finite () ? "%+.2f%%".printf (f * 100) : "—"; }
 
 // Draw Pango markup in the current cairo color, its (ax, ay) fraction anchored at (x, y).
-// Draws nothing and returns false if it would not fit in max_w x max_h.
+// Text that would not fit in max_w x max_h is cut short with an ellipsis if `ellipsize`; otherwise
+// nothing is drawn and the result is false.
 bool draw_text (Gtk.Widget widget, Cairo.Context cr, string markup, double x, double y, double ax, double ay,
-                double max_w = double.MAX, double max_h = double.MAX) {
+                double max_w = double.MAX, double max_h = double.MAX, bool ellipsize = false) {
     var layout = widget.create_pango_layout (null);
     layout.set_markup (markup, -1);
     layout.set_alignment (ax == 0.5 ? Pango.Alignment.CENTER : Pango.Alignment.LEFT);
+    if (ellipsize) {
+        layout.set_width ((int) (max_w * Pango.SCALE));
+        layout.set_ellipsize (Pango.EllipsizeMode.END);
+    }
     int w, h;
     layout.get_pixel_size (out w, out h);
     if (w > max_w || h > max_h) return false;

@@ -10,7 +10,7 @@ const int COL_GAIN = 9;
 
 public class Window : Adw.ApplicationWindow {
     Portfolio p = new Portfolio ();
-    Yahoo yahoo = new Yahoo ();
+    Feed feed = new Feed ();
     Range range = Range.D1;
     string path = Path.build_filename (Environment.get_user_data_dir (), "stonks", "portfolio.json");
     GenericSet<string> loading = new GenericSet<string> (str_hash, str_equal);
@@ -288,10 +288,10 @@ public class Window : Adw.ApplicationWindow {
         try {
             var q = p.quotes[symbol];
             if (q == null || full) {
-                p.quotes[symbol] = yield yahoo.fetch (symbol);
+                p.quotes[symbol] = yield feed.fetch (symbol);
                 if (q == null) sync ();   // a new holding can need FX pairs we don't have yet
             } else {
-                yield yahoo.refresh (q);
+                yield feed.refresh (q);
             }
         } catch (Error e) {
             if (asked || !failing) fail (@"$symbol: $(e.message)");   // background refreshes report an outage once
@@ -343,7 +343,7 @@ public class Window : Adw.ApplicationWindow {
         form.append (hits);
         form.append (rest);
 
-        var dialog = new Adw.AlertDialog ("Add position", "Search by name, or type a Yahoo Finance ticker: AAPL, 7203.T, 005930.KS, VNM.VN, 600519.SS. Leave the price empty to use that day's close.") {
+        var dialog = new Adw.AlertDialog ("Add position", "Search by name or ticker: AAPL, 7203.T, 005930.KS, 600519.SS, or PVS.VN for any Vietnamese exchange. Leave the price empty to use that day's close.") {
             extra_child = form, default_response = "add", close_response = "cancel", prefer_wide_layout = true
         };
         dialog.add_response ("cancel", "Cancel");
@@ -361,9 +361,8 @@ public class Window : Adw.ApplicationWindow {
                 return;
             }
             Timeout.add (250, () => {
-                if (mine == serial) yahoo.search.begin (text, (obj, res) => {
-                    Hit[] found = {};
-                    try { found = yahoo.search.end (res); } catch (Error e) {}
+                if (mine == serial) feed.search.begin (text, (obj, res) => {
+                    var found = feed.search.end (res);
                     if (mine != serial) return;
                     hits.remove_all ();
                     foreach (var hit in found)

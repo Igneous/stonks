@@ -15,7 +15,7 @@ APP    = io.github.igneous.Stonks
 PREFIX ?= $(HOME)/.local
 SDK    ?= org.gnome.Sdk//48
 PKGS   = --pkg gtk4 --pkg libadwaita-1 --pkg libsoup-3.0 --pkg json-glib-1.0
-SRC    = src/model.vala src/yahoo.vala src/chart.vala src/heatmap.vala src/window.vala
+SRC    = src/model.vala src/feed.vala src/chart.vala src/heatmap.vala src/window.vala
 VALAC  = valac -X -lm -X -w -X -O2
 
 build/stonks: $(SRC)

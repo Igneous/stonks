@@ -28,14 +28,14 @@ public class Series {
     public double at (int64 ts) { return n == 0 ? double.NAN : v[int.max (before (ts + 1), 0)]; }
 }
 
-// One instrument as Yahoo quotes it. `daily` always has at least one bar.
+// One instrument as its feed quotes it. `daily` always has at least one bar.
 public class Quote {
     public string symbol = "";
     public string name = "";
     public string currency = "";
     public int gmtoffset;                    // exchange timezone, seconds east of UTC
     public double price;
-    public double prev_close = double.NAN;   // previous session's close per Yahoo; NaN = derive it from daily
+    public double prev_close = double.NAN;   // previous session's close when the feed states one; NaN = derive it from daily
     public Series daily = new Series ();     // full history, 1d bars; the last bar is the live session
     public Series intra = new Series ();     // last 7 days, 5m bars
 
@@ -137,7 +137,7 @@ public class Tile {
 
 public class Portfolio {
     public GLib.ListStore lots = new GLib.ListStore (typeof (Lot));
-    // Quotes as Yahoo gives them, in their own currencies; includes the FX pairs (JPYUSD=X).
+    // Quotes as the feed gives them, in their own currencies; includes the FX pairs (JPYUSD=X).
     public HashTable<string, Quote> quotes = new HashTable<string, Quote> (str_hash, str_equal);
     // The held ones repriced into `currency`. Derived: call rebase() after quotes or currency change.
     public HashTable<string, Quote> converted = new HashTable<string, Quote> (str_hash, str_equal);

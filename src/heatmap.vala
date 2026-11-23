@@ -83,11 +83,9 @@ public class Matrix : Gtk.DrawingArea {
         for (int row = 0; row <= tiles.length; row++) {
             double y = ROW * (row + 1);
             var t = row > 0 ? tiles[row - 1] : null;
-            var bold = "<b>%s</b>".printf (t != null ? Markup.escape_text (t.symbol) : "Portfolio");
-            string[] fits = { bold + (t != null ? "  <span alpha='60%%'>%s</span>".printf (Markup.escape_text (t.name)) : ""), bold };
+            var label = t != null ? "<b>%s</b>  <span alpha='60%%'>%s</span>".printf (Markup.escape_text (t.symbol), Markup.escape_text (t.name)) : "<b>Portfolio</b>";
             cr.set_source_rgba (fg.red, fg.green, fg.blue, 1);
-            foreach (var markup in fits)
-                if (draw_text (this, cr, markup, 12, y + ROW / 2.0, 0, 0.5, label_w - 20)) break;
+            draw_text (this, cr, label, 12, y + ROW / 2.0, 0, 0.5, label_w - 20, ROW, true);
 
             for (int c = 0; c < RANGE_LABELS.length; c++) {
                 double change;
