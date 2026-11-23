@@ -32,14 +32,15 @@ public class Series {
     }
 
     // Whether a re-fetched stretch of daily history still says what ours does: every day the two share
-    // (its last aside, that being the live bar) within 0.01%. A split or a dividend adjustment rewrites
-    // the past, and then they don't. Also false if they share no day at all.
+    // within 0.01%. A split or a dividend adjustment rewrites the past, and then they don't. The last
+    // bar of each is left out, being live: its is still moving, and ours stopped wherever the price
+    // stood when we last asked, mid-session as likely as not. Also false if they share no day at all.
     public bool agrees (Series fresh, int gmtoffset) {
         int shared = 0;
         for (int i = 0; i < fresh.n - 1; i++) {
             int64 day = (fresh.t[i] + gmtoffset) / 86400;
             int j = before ((day + 1) * 86400 - gmtoffset);   // our last bar before that day ends
-            if (j < 0 || (t[j] + gmtoffset) / 86400 != day) continue;
+            if (j < 0 || j == n - 1 || (t[j] + gmtoffset) / 86400 != day) continue;
             if (Math.fabs (v[j] / fresh.v[i] - 1) > 1e-4) return false;
             shared++;
         }

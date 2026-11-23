@@ -312,6 +312,9 @@ void main () {
     live.add (T0 + 8 * DAY + 9 * 3600, 108);
     live.add (T0 + 9 * DAY + 15 * 3600, 999);                                           // its last bar is live: not compared
     assert (c.daily.agrees (live, 0));
+    var quit = quote ("Q", "USD", 100, 1);
+    quit.daily.set_last (50);                                                           // closed mid-session: day 9 is wherever it stood
+    assert (quit.daily.agrees (tail, 0));                                               // ...which is no rewritten past
     var later = new Series ();
     for (int d = 20; d < 23; d++) later.add (T0 + d * DAY, 1);
     assert (!c.daily.agrees (later, 0));                                                // nothing in common proves nothing
