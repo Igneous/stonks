@@ -609,7 +609,18 @@ public class Matrix : Gtk.DrawingArea {
                 cr.rectangle (label_w + cell_w * c + 1, y + 1, cell_w - 2, ROW - 2);
                 cr.fill ();
                 cr.set_source_rgb (1, 1, 1);
-                draw_text (this, cr, pct (change), label_w + cell_w * (c + 0.5), y + ROW / 2.0, 0.5, 0.5, cell_w - 4);
+                // A move of 100% or more loses its decimals, and a figure still wider than its cell (a
+                // narrow window) is shrunk to fit rather than left out.
+                var figure = text_layout (this, change.abs () >= 1 ? "%+.0f%%".printf (change * 100) : pct (change), true);
+                int w, h;
+                figure.get_pixel_size (out w, out h);
+                double fit = double.min (1, (cell_w - 6) / w);
+                cr.save ();
+                cr.translate (label_w + cell_w * (c + 0.5), y + ROW / 2.0);
+                cr.scale (fit, fit);
+                cr.move_to (-w / 2.0, -h / 2.0);
+                Pango.cairo_show_layout (cr, figure);
+                cr.restore ();
             }
         }
     }
