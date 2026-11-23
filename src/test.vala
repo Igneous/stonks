@@ -45,6 +45,18 @@ void main () {
     // 5m bars take over for short ranges once there are some
     for (int i = 0; i < 4; i++) a.intra.add (T0 + 9 * DAY + 9 * 3600 + i * 300, 108.5 + i * 0.1);
     assert (a.view (Range.D1, NOW).n == 4 && a.view (Range.D30, NOW).n == 10);
+    int today;
+    assert (a.trail (Range.D1, NOW, out today).n == 4 && today == 0);                   // no session before it to lead in with
+    a.intra = new Series ();
+    // early in a session a 1D chart is led in by the session before: six bars on day 8, then day 9's
+    for (int i = 0; i < 6; i++) a.intra.add (T0 + 8 * DAY + 9 * 3600 + i * 300, 107 + i * 0.1);
+    assert (a.trail (Range.D1, NOW, out today).n == 1 && today == 0);                   // day 9 has no bars yet: view()'s one daily bar
+    a.intra.add (T0 + 9 * DAY + 9 * 3600, 108.5);
+    var led = a.trail (Range.D1, NOW, out today);
+    assert (led.n == 6 && today == 5 && led.t[0] == T0 + 8 * DAY + 9 * 3600 + 300);     // five of day 8's, one of day 9's
+    for (int i = 1; i < 6; i++) a.intra.add (T0 + 9 * DAY + 9 * 3600 + i * 300, 108.5 + i * 0.1);
+    assert (a.trail (Range.D1, NOW, out today).n == 6 && today == 0);                   // a full session: today alone
+    assert (a.trail (Range.D30, NOW, out today).n == 10 && today == 0);                 // other ranges are view()'s
     a.intra = new Series ();
 
     // tick: same exchange day overwrites the live bar, a new day appends one

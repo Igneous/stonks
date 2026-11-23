@@ -150,6 +150,28 @@ public class Quote {
         return s;
     }
 
+    // The same for one instrument's chart, where 1D is a session's worth of 5-minute bars ending now:
+    // early in a session, the end of the one before leads in (nights, weekends and holidays count for
+    // nothing), so that the open isn't twenty minutes stretched across the whole chart. `today` is
+    // the index the latest session starts at, for a line to be drawn there; 0 when it fills the view
+    // on its own, which by its close it does.
+    public Series trail (Range r, int64 now, out int today) {
+        today = 0;
+        int first = intra.before (start (r, now)) + 1;   // the latest session's first bar
+        int have = intra.n - first;
+        if (r != Range.D1 || first == 0 || have == 0) return view (r, now);
+        // The session before: the bars that share a date, on the exchange's clock, with the last of them.
+        int64 eve = (intra.t[first - 1] + gmtoffset) / 86400;
+        int prior = first;
+        while (prior > 0 && (intra.t[prior - 1] + gmtoffset) / 86400 == eve) prior--;
+        int lead = first - prior - have;   // how many of its bars today's haven't pushed out yet
+        if (lead <= 0) return view (r, now);
+        var s = new Series ();
+        for (int i = first - lead; i < intra.n; i++) s.add (intra.t[i], intra.v[i]);
+        today = lead;
+        return s;
+    }
+
     // The lowest and highest close since `from`, out of a series: what stands in for a day's range or
     // a 52-week range when the feed gives none. NaN if there is nothing that recent.
     public static void extremes (Series s, int64 from, out double lowest, out double highest) {

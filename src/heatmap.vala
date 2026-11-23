@@ -227,7 +227,8 @@ public class Treemap : Gtk.DrawingArea {
     void chart (Cairo.Context cr, Tile t) {
         var q = p.quotes[t.symbol];
         if (q == null || t.w < 30 || t.h < 30) return;
-        var s = q.view (range, now_s ());
+        int today;
+        var s = q.trail (range, now_s (), out today);
         if (s.n < 2) return;
         int step = int.max (1, (int) (s.n / (t.w / 2)));   // a point every two pixels is as fine as it can show
         double lo = s.v[0], hi = s.v[0];
@@ -251,6 +252,16 @@ public class Treemap : Gtk.DrawingArea {
         cr.set_line_width (1.5);
         cr.set_line_join (Cairo.LineJoin.ROUND);
         cr.stroke ();
+        if (today > 0) {
+            // Left of this is the session before, leading in (see Quote.trail); right of it, today.
+            double x = Math.round (left + width * (today - 0.5) / (s.n - 1)) + 0.5;
+            cr.set_source_rgba (1, 1, 1, 0.5);
+            cr.set_line_width (1);
+            cr.set_dash ({ 3, 3 }, 0);
+            cr.move_to (x, t.y);
+            cr.line_to (x, t.y + t.h);
+            cr.stroke ();
+        }
         cr.restore ();
     }
 

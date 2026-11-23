@@ -54,6 +54,7 @@ public class Chart : Gtk.DrawingArea {
     double basis = double.NAN;
     bool up = true;
     Range range;
+    int today;
     string currency = "";
     int hover = -1;
     // Plot geometry, set by paint().
@@ -76,7 +77,10 @@ public class Chart : Gtk.DrawingArea {
     }
 
     // Show a series; `basis` (NaN for none) is drawn as the dashed reference line, `up` picks green or red.
-    public void plot (Series s, double basis, bool up, Range range, string currency) {
+    // `today`, if not 0, is the point the latest session starts at (see Quote.trail): an upright
+    // dashed line sets it off from the session before.
+    public void plot (Series s, double basis, bool up, Range range, string currency, int today = 0) {
+        this.today = today;
         this.currency = currency;
         this.s = s;
         this.basis = basis;
@@ -130,7 +134,7 @@ public class Chart : Gtk.DrawingArea {
             draw_text (this, cr, money (v, currency), LEFT + pw + 8, y, 0, 0.5);
         }
         // A 1D view of holdings on several exchanges strings their sessions together, so name the day.
-        bool span_days = range == Range.D1 && s.t[s.n - 1] - s.t[0] > 86400;
+        bool span_days = range == Range.D1 && (today > 0 || s.t[s.n - 1] - s.t[0] > 86400);
         string last = "";
         for (int i = 0; i <= 4; i++) {
             int k = (s.n - 1) * i / 4;
@@ -144,6 +148,15 @@ public class Chart : Gtk.DrawingArea {
             cr.set_dash ({ 4, 4 }, 0);
             cr.move_to (LEFT, Math.round (py (basis)) + 0.5);
             cr.line_to (LEFT + pw, Math.round (py (basis)) + 0.5);
+            cr.stroke ();
+            cr.set_dash (null, 0);
+        }
+        if (today > 0 && today < s.n) {
+            double x = Math.round ((px (today - 1) + px (today)) / 2) + 0.5;
+            cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.45);
+            cr.set_dash ({ 4, 4 }, 0);
+            cr.move_to (x, TOP);
+            cr.line_to (x, TOP + ph);
             cr.stroke ();
             cr.set_dash (null, 0);
         }

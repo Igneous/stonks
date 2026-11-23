@@ -510,7 +510,9 @@ public class Window : Adw.ApplicationWindow {
         if (s.extra != "") when += "%s %s %s".printf (s.extra, money (s.extra_price, q.currency), pct (s.extra_change / 100));
         card_status.label = string.joinv ("  ·  ", when);
         card_status.visible = when.length > 0;
-        chart.plot (q.view (range, now), basis, moved >= 0, range, q.currency);
+        int today;
+        var points = q.trail (range, now, out today);
+        chart.plot (points, basis, moved >= 0, range, q.currency, today);
         var values = facts_of (q, now);
         for (int i = 0; i < FACTS.length; i++) fact_values[i].label = values[i];
     }
