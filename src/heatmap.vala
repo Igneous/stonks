@@ -138,19 +138,10 @@ public class Treemap : Gtk.DrawingArea {
         cr.restore ();
     }
 
-    // The tile's logo in its top left corner (beside the label in the top row), if it has one and
-    // there is room for it without crowding the label.
-    void logo (Cairo.Context cr, Tile t) {
-        var image = logos[t.symbol];
-        if (image == null) return;
-        double size = (double.min (t.w, t.h) * 0.2).clamp (16, 40), x = t.x + 8, y = t.y + 8;
-        if (t.kind == TileKind.BENCHMARK) {
-            size = 24;
-            y = t.y + (t.h - size) / 2;
-            if (t.w < 200) return;
-        } else if (t.w < size * 3.2 || t.h < size * 3.2) {
-            return;
-        }
+    // A logo as a small rounded badge with its corner at (x, y). On a white plate: most logos are
+    // drawn for a white page and vanish on a red or green tile. Fitted, not stretched: some are
+    // wordmarks, wider than they are tall.
+    void badge (Cairo.Context cr, Cairo.ImageSurface image, double x, double y, double size) {
         double r = size * 0.22;
         cr.save ();
         cr.new_sub_path ();
@@ -160,11 +151,11 @@ public class Treemap : Gtk.DrawingArea {
         cr.arc (x + r, y + r, r, Math.PI, Math.PI * 1.5);
         cr.close_path ();
         cr.clip ();
-        // On a white plate: most logos are drawn for a white page and vanish on a red or green tile.
         cr.set_source_rgb (1, 1, 1);
         cr.paint ();
-        cr.translate (x, y);
-        cr.scale (size / image.get_width (), size / image.get_height ());
+        double fit = size / double.max (image.get_width (), image.get_height ());
+        cr.translate (x + (size - image.get_width () * fit) / 2, y + (size - image.get_height () * fit) / 2);
+        cr.scale (fit, fit);
         cr.set_source_surface (image, 0, 0);
         cr.get_source ().set_filter (Cairo.Filter.GOOD);
         cr.paint ();
@@ -193,26 +184,36 @@ public class Treemap : Gtk.DrawingArea {
         return spot != null || (block != null && moving.kind == TileKind.STOCK);
     }
 
-    // A stock's tile: its symbol, its change and its name, stacked and centered. The name is what says
-    // which company 8306.T is, so it stays: it wraps onto two lines, is cut with an ellipsis beyond
-    // that, and the whole label shrinks before anything is left out. Only a tile too low for three
-    // lines of the smallest text loses the name, and then the change.
+    // A stock's tile: its logo, its symbol, its change and its name, stacked and centered. The name is
+    // what says which company 8306.T is, so it stays: it wraps onto two lines, is cut with an ellipsis
+    // beyond that, and the text shrinks before anything is left out. The logo comes along where there
+    // is room for it with the text no more than two steps down; it is not worth smaller text than that.
+    // Only a tile too low for three lines of the smallest text loses the name, and then the change.
     void label (Cairo.Context cr, Tile t) {
         double fit = double.min (t.w / 8, t.h / 4).clamp (7, 26), inner = t.w - 10;
+        double mark = (double.min (t.w, t.h) * 0.2).clamp (18, 40);
         bool named = t.name != "" && t.name != t.symbol;
+        var image = logos[t.symbol];
+        double[] scales = { 1, 0.8, 0.64, 1, 0.8, 0.64, 0.5 };   // the first three are tried with the logo
         for (int parts = named ? 3 : 2; parts >= 1; parts--) {
-            foreach (double scale in new double[] { 1, 0.8, 0.64, 0.5 }) {
-                double size = double.max (fit * scale, 6);
+            for (int k = image != null ? 0 : 3; k < scales.length; k++) {
+                bool with_logo = k < 3;
+                double size = double.max (fit * scales[k], 6);
                 Pango.Layout[] rows = { text_layout (this, "<span font_desc='Bold %.1f'>%s</span>".printf (size, Markup.escape_text (t.symbol)), true, inner, 1) };
                 if (parts >= 2) rows += text_layout (this, "<span font_desc='%.1f'>%s</span>".printf (size * 0.75, pct (t.change)), true, inner, 1);
                 if (parts >= 3) rows += text_layout (this, "<span font_desc='%.1f' alpha='75%%'>%s</span>".printf (size * 0.5 + 3, Markup.escape_text (t.name)), true, inner, 2);
-                int total = 0, w, h;
+                int total = with_logo ? (int) mark + 6 : 0, w, h;
                 foreach (var row in rows) {
                     row.get_pixel_size (out w, out h);
                     total += h;
                 }
                 if (total > t.h - 6) continue;
                 double y = t.y + (t.h - total) / 2;
+                if (with_logo) {
+                    badge (cr, image, t.x + (t.w - mark) / 2, y, mark);
+                    y += mark + 6;
+                    cr.set_source_rgb (1, 1, 1);
+                }
                 foreach (var row in rows) {
                     row.get_pixel_size (out w, out h);
                     cr.move_to (t.x + 5, y);
@@ -258,7 +259,6 @@ public class Treemap : Gtk.DrawingArea {
             cr.rectangle (t.x + 1, t.y + 1, t.w - 2, t.h - 2);
             cr.fill ();
             if (charts) chart (cr, t);
-            logo (cr, t);
             if (any_held && t.kind == TileKind.STOCK && t.value <= 0) {
                 // Watched next to real holdings: a dashed outline says this tile's size isn't money.
                 cr.set_source_rgba (1, 1, 1, 0.55);
@@ -283,8 +283,18 @@ public class Treemap : Gtk.DrawingArea {
                 "<span font_desc='Bold %.0f'>%s</span>\n<span font_desc='%.0f'>%s</span>".printf (size, symbol, size * 0.85, pct (t.change)),
                 "<span font_desc='Bold %.0f'>%s</span>".printf (size, symbol)
             };
-            foreach (var markup in fits)
-                if (draw_text (this, cr, markup, t.x + t.w / 2, t.y + t.h / 2, 0.5, 0.5, t.w - 10, t.h - 6)) break;
+            foreach (var markup in fits) {
+                var text = text_layout (this, markup, true);
+                int w, h;
+                text.get_pixel_size (out w, out h);
+                if (w > t.w - 10 || h > t.h - 6) continue;
+                cr.move_to (t.x + (t.w - w) / 2, t.y + (t.h - h) / 2);
+                Pango.cairo_show_layout (cr, text);
+                // Its logo just to the left of the text, if the tile is wide enough to spare the room.
+                var image = logos[t.symbol];
+                if (image != null && (t.w - w) / 2 >= 24 + 14) badge (cr, image, t.x + (t.w - w) / 2 - 24 - 8, t.y + (t.h - 24) / 2, 24);
+                break;
+            }
         }
         // Where a dragged thing would land: a thick white edge on the side of the tile it would go
         // beside (top and left for before, bottom and right for after), or an outline of the folder.

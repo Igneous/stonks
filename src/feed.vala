@@ -299,27 +299,40 @@ public class Feed {
 
     // Find a symbol's logo and remember the answer. Null if it has none; throws if we couldn't find out,
     // in which case nothing is remembered and it can be tried another day.
-    //   a Vietnamese ticker   Simplize's logo CDN, by ticker
-    //   a coin                the image Yahoo's quote links to
-    //   a company             the best icon its own website declares; Yahoo's profile says which site
-    //   anything else         none, without asking anyone: indices, funds and pairs have no site of their own
+    //   an index, pair or future   none, without asking anyone: there is no such logo
+    //   a Vietnamese ticker        Simplize's logo CDN, by ticker
+    //   everything else            Financial Modeling Prep's logo images, by ticker: proper brand logos
+    //                              for stocks, funds and coins on every exchange we use, at 100px and up
+    //   ...and if it has none      a coin: the image Yahoo's quote links to
+    //                              a company: an icon from its own website (see site_icon)
     public async Bytes? logo (string symbol, string kind) throws Error {
         Bytes? image = null;
-        if (from_ssi (symbol)) {
-            if (!symbol.has_prefix ("^")) image = yield image_at (@"https://cdn.simplize.vn/simplizevn/logo/$(Uri.escape_string (ssi_code (symbol))).jpeg");
-        } else if (kind == "CRYPTOCURRENCY") {
-            var quotes = yield quote_batch ({ symbol }, "logoUrl");
-            if (quotes == null) throw new IOError.FAILED ("Yahoo's quote can't be reached");
-            if (quotes.get_length () > 0) image = yield image_at (quotes.get_object_element (0).get_string_member_with_default ("logoUrl", ""));
-        } else if (kind == "EQUITY" || kind == "") {
-            image = yield site_icon (symbol);
+        bool unsure = false;   // a source couldn't be reached, so "none" would be a guess
+        if (kind == "INDEX" || kind == "CURRENCY" || kind == "FUTURE") {
+        } else if (from_ssi (symbol)) {
+            image = yield image_at (@"https://cdn.simplize.vn/simplizevn/logo/$(Uri.escape_string (ssi_code (symbol))).jpeg");
+        } else {
+            try {
+                image = yield image_at (@"https://financialmodelingprep.com/image-stock/$(Uri.escape_string (symbol, "=")).png");
+            } catch (Error e) {
+                unsure = true;
+            }
+            if (image == null && kind == "CRYPTOCURRENCY") {
+                var quotes = yield quote_batch ({ symbol }, "logoUrl");
+                if (quotes == null) throw new IOError.FAILED ("Yahoo's quote can't be reached");
+                if (quotes.get_length () > 0) image = yield image_at (quotes.get_object_element (0).get_string_member_with_default ("logoUrl", ""));
+            }
+            if (image == null && (kind == "EQUITY" || kind == "")) image = yield site_icon (symbol);
         }
+        if (image == null && unsure) throw new IOError.FAILED ("the logo source can't be reached");
         cache.save_logo (symbol, image);
         return image;
     }
 
-    // The icon of the company's own website. Yahoo's profile names the site; the site's front page says
-    // where its icons are. Two requests to the company at most, once.
+    // The icon of the company's own website, for when nobody has its logo. Yahoo's profile names the
+    // site; the site's front page says where its icons are. A site that declares nothing large is also
+    // asked for /apple-touch-icon.png, which many keep without mentioning it (apple.com does). Plenty of
+    // big companies really do publish nothing over 16 to 48 pixels, though.
     async Bytes? site_icon (string symbol) throws Error {
         var root = yield authed (@"$YAHOO/v10/finance/quoteSummary/$(Uri.escape_string (symbol, "="))?modules=assetProfile");
         if (root == null) throw new IOError.FAILED ("Yahoo's company profile can't be reached");
@@ -334,9 +347,12 @@ public class Feed {
         // Yahoo answered, so the network is fine: if the company's site won't play, that is its answer.
         try {
             string where = site, icon = "/favicon.ico";
+            int score = -1;
             var page = yield fetch (site, out where);
-            if (page != null) icon = best_icon (((string) page.get_data ()).substring (0, (long) page.get_size ()));
-            var image = yield image_at (Uri.resolve_relative (where, icon, UriFlags.NONE));
+            if (page != null) icon = best_icon (((string) page.get_data ()).substring (0, (long) page.get_size ()), out score);
+            Bytes? image = null;
+            if (score < 64) image = yield image_at (Uri.resolve_relative (where, "/apple-touch-icon.png", UriFlags.NONE));
+            if (image == null) image = yield image_at (Uri.resolve_relative (where, icon, UriFlags.NONE));
             if (image == null && icon != "/favicon.ico") image = yield image_at (Uri.resolve_relative (where, "/favicon.ico", UriFlags.NONE));
             return image;
         } catch (Error e) {
@@ -345,10 +361,11 @@ public class Feed {
     }
 
     // The best icon a page declares: an apple-touch-icon if it has one (large, and drawn to stand on its
-    // own), otherwise its largest rel=icon, otherwise the conventional /favicon.ico.
-    static string best_icon (string html) {
+    // own), otherwise its largest rel=icon, otherwise the conventional /favicon.ico. `best_score` is
+    // roughly its declared size in pixels (1000 and up for a touch icon, -1 if the page declares none).
+    static string best_icon (string html, out int best_score) {
         string best = "/favicon.ico";
-        int best_score = -1;
+        best_score = -1;
         try {
             // RAW: pages are not always the UTF-8 they claim to be.
             var link = new Regex ("<link\\b[^>]*>", RegexCompileFlags.CASELESS | RegexCompileFlags.RAW);

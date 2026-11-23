@@ -178,6 +178,7 @@ public class Window : Adw.ApplicationWindow {
             feed.forget_logos ();
             logos.remove_all ();
             logo_seen.remove_all ();
+            if (logo_queue.length > 0) logo_queue.remove_range (0, logo_queue.length);   // update() queues them all again
             treemap.clear_logos ();
             update ();
         });
