@@ -29,6 +29,46 @@ public class Hit {
 }
 
 public class Feed {
+    // Markets a search can be kept to (the add dialog's dropdown): a label, then how the market's
+    // symbols are told apart. That is a Yahoo suffix (".T"); "US" for unsuffixed stocks and funds; or
+    // "=" and an instrument type as Yahoo's lookup names it. The first is no constraint at all.
+    public const string[] MARKETS = {
+        "Auto", "",
+        "United States", "US",
+        "Tokyo", ".T",
+        "Korea (KOSPI)", ".KS",
+        "Korea (KOSDAQ)", ".KQ",
+        "Shanghai", ".SS",
+        "Shenzhen", ".SZ",
+        "Hong Kong", ".HK",
+        "Vietnam", ".VN",
+        "Taiwan", ".TW",
+        "Singapore", ".SI",
+        "India (NSE)", ".NS",
+        "India (BSE)", ".BO",
+        "Indonesia", ".JK",
+        "Thailand", ".BK",
+        "Malaysia", ".KL",
+        "Australia", ".AX",
+        "London", ".L",
+        "Xetra", ".DE",
+        "Frankfurt", ".F",
+        "Paris", ".PA",
+        "Amsterdam", ".AS",
+        "Milan", ".MI",
+        "Madrid", ".MC",
+        "Switzerland", ".SW",
+        "Stockholm", ".ST",
+        "Toronto", ".TO",
+        "Sao Paulo", ".SA",
+        "ETFs", "=etf",
+        "Mutual funds", "=mutualfund",
+        "Indices", "=index",
+        "Crypto", "=cryptocurrency",
+        "Currencies", "=currency",
+        "Futures", "=future"
+    };
+
     const string YAHOO = "https://query1.finance.yahoo.com";
     const string SSI_BARS = "https://iboard-api.ssi.com.vn/statistics/charts/history";
     const string SSI_INFO = "https://iboard-query.ssi.com.vn/stock";
@@ -39,6 +79,15 @@ public class Feed {
     HashTable<string, double?> per_usd = new HashTable<string, double?> (str_hash, str_equal);   // see rate_hits()
     HashTable<string, Found> found = new HashTable<string, Found> (str_hash, str_equal);          // see search()
     Cache cache;
+    GenericArray<Listed>? vietnam;   // see load_vietnam()
+
+    // A company on a list we search ourselves.
+    class Listed {
+        public string symbol;
+        public string name;
+        public string board;
+        public string words;   // everything it might be searched by: ticker, names, nickname
+    }
 
     class Found {
         public Hit[] hits;
@@ -162,15 +211,17 @@ public class Feed {
 
     // The exact ticker in Vietnam if there is one (on any of its three boards), then up to five Yahoo
     // matches by name or ticker.
-    // ponytail: Vietnamese companies are found by ticker only; searching them by name needs a symbol
-    // list (trading.vietcap.com.vn/api/price/symbols/getAll has one) filtered here.
+    // With no market chosen, Vietnamese companies are found by exact ticker only (plus whatever Yahoo's
+    // search knows of Ho Chi Minh); choosing Vietnam searches the full list by name, see find_in().
     // Prices and market caps come in the security's own currency, with `into` as a second opinion.
-    public async Hit[] search (string text, string into) {
+    // `market` is one of MARKETS' codes: "" searches everywhere, anything else only there.
+    public async Hit[] search (string text, string into, string market = "") {
         var now = get_real_time () / 1000000;
-        var key = into + "\n" + text.down ();
+        var key = into + "\n" + market + "\n" + text.down ();
         var seen = found[key];
         if (seen != null && now - seen.at < 900) return seen.hits;   // typed again within a quarter of an hour
-        var hits = yield find (text);
+        Hit[] hits;
+        if (market == "") hits = yield find (text); else hits = yield find_in (text, market);
         yield rate_hits (hits, into);
         found[key] = new Found () { hits = hits, at = now };
         return hits;
@@ -189,28 +240,8 @@ public class Feed {
             foreach (var hit in pair) if (hit.price.is_finite ()) hits += hit;
             if (hits.length > 0) return hits;
         }
-        var code = text.up ();
-        if (code.has_suffix (".VN")) code = code[0:code.length - 3];
-        bool plausible = code.length >= 3 && code.length <= 8;
-        for (int i = 0; i < code.length; i++) plausible &= code[i].isalnum ();
-        if (plausible) {
-            var info = yield ssi_info (code);
-            bool index = code == "VNINDEX" || code == "VN30" || code == "HNXINDEX";
-            if (info != null || index) {
-                var hit = new Hit () { symbol = index ? "^" + code + ".VN" : code + ".VN", name = code, detail = "Index · Vietnam", currency = "VND" };
-                if (info != null) {
-                    hit.name = info.get_string_member_with_default ("companyNameEn", code);
-                    hit.detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ());
-                    hit.price = info.get_double_member_with_default ("refPrice", double.NAN);   // yesterday's close, unless...
-                }
-                try {
-                    var bars = yield ssi_bars (hit.symbol, "5", get_real_time () / 1000000 - 7 * 86400);
-                    if (bars.n > 0) hit.price = bars.v[bars.n - 1];                               // ...it has traded since
-                } catch (Error e) {}
-                if (info != null) hit.cap = hit.price * info.get_double_member_with_default ("listedShare", double.NAN);
-                hits += hit;
-            }
-        }
+        var vietnamese = yield ssi_hit (text);
+        if (vietnamese != null) hits += vietnamese;
         try {
             var root = yield get_json (@"$YAHOO/v1/finance/search?q=$(Uri.escape_string (text))&quotesCount=5&newsCount=0");
             var quotes = root.has_member ("quotes") ? root.get_array_member ("quotes") : new Json.Array ();
@@ -237,6 +268,127 @@ public class Feed {
     // Fill in price and market cap for the Yahoo hits, all in one request. Unlike Yahoo's other
     // endpoints this one wants a cookie plus a matching "crumb" token; Yahoo hands both to anyone who
     // asks, no account involved. If it stops working the hits simply come without numbers.
+    // Vietnam's listed stocks and funds, all three boards, so they can be searched by name: English,
+    // Vietnamese (with or without the accents) or nickname ("Vinamilk"). One download of Vietcap's
+    // symbol directory, kept for a week.
+    async void load_vietnam () {
+        if (vietnam != null) return;
+        var now = get_real_time () / 1000000;
+        var body = cache.kept ("vietnam", 7 * 86400, now);
+        bool fresh = body == null;
+        try {
+            string where;
+            if (body == null) body = yield fetch ("https://trading.vietcap.com.vn/api/price/symbols/getAll", out where);
+            if (body == null) return;
+            var parser = new Json.Parser ();
+            yield parser.load_from_stream_async (new MemoryInputStream.from_bytes (body), null);
+            var list = new GenericArray<Listed> ();
+            var all = parser.get_root ().get_array ();
+            for (uint i = 0; i < all.get_length (); i++) {
+                var o = all.get_object_element (i);
+                var type = o.get_string_member_with_default ("type", ""), board = o.get_string_member_with_default ("board", "");
+                if ((type != "STOCK" && type != "ETF") || (board != "HSX" && board != "HNX" && board != "UPCOM")) continue;   // not warrants, bonds or the delisted
+                var code = o.get_string_member_with_default ("symbol", "");
+                var english = o.get_string_member_with_default ("enOrganName", ""), local = o.get_string_member_with_default ("organName", "");
+                list.add (new Listed () {
+                    symbol = code + ".VN", name = english != "" ? english : local, board = board == "HSX" ? "HOSE" : board,
+                    words = "%s %s %s %s".printf (code, english, o.get_string_member_with_default ("organShortName", ""), local)
+                });
+            }
+            if (list.length == 0) return;
+            // Ho Chi Minh's first, then Hanoi's, then UPCoM: roughly biggest first, as matches are taken in order.
+            list.sort ((a, b) => a.board != b.board ? "HOSE HNX UPCOM".index_of (a.board) - "HOSE HNX UPCOM".index_of (b.board) : strcmp (a.symbol, b.symbol));
+            vietnam = list;
+            if (fresh) cache.keep ("vietnam", body, now);
+        } catch (Error e) {}
+    }
+
+    // Text that is exactly a Vietnamese ticker (or one of the indices), on any of the three boards: SSI
+    // knows them all, where Yahoo only lists Ho Chi Minh. Null if it isn't one.
+    async Hit? ssi_hit (string text) {
+        var code = text.up ();
+        if (code.has_suffix (".VN")) code = code[0:code.length - 3];
+        bool plausible = code.length >= 3 && code.length <= 8;
+        for (int i = 0; i < code.length; i++) plausible &= code[i].isalnum ();
+        if (!plausible) return null;
+        var info = yield ssi_info (code);
+        bool index = code == "VNINDEX" || code == "VN30" || code == "HNXINDEX";
+        if (info == null && !index) return null;
+        var hit = new Hit () { symbol = index ? "^" + code + ".VN" : code + ".VN", name = code, detail = "Index · Vietnam", currency = "VND" };
+        if (info != null) {
+            hit.name = info.get_string_member_with_default ("companyNameEn", code);
+            hit.detail = "%s · Vietnam".printf (info.get_string_member_with_default ("exchange", "").up ());
+            hit.price = info.get_double_member_with_default ("refPrice", double.NAN);   // yesterday's close, unless...
+        }
+        try {
+            var bars = yield ssi_bars (hit.symbol, "5", get_real_time () / 1000000 - 7 * 86400);
+            if (bars.n > 0) hit.price = bars.v[bars.n - 1];                               // ...it has traded since
+        } catch (Error e) {}
+        if (info != null) hit.cap = hit.price * info.get_double_member_with_default ("listedShare", double.NAN);
+        return hit;
+    }
+
+    // Search one market only. Yahoo's search endpoint gives seven results at most and can't be
+    // narrowed, so this asks its lookup endpoint instead: up to a hundred matches for the text, each
+    // with its symbol and type, of which we keep the first six that belong to the market.
+    async Hit[] find_in (string text, string market) {
+        Hit[] hits = {};
+        string[] industries = {};
+        yield load_names ();
+        if (market == ".VN") {
+            // Vietnam we search ourselves: Yahoo's lookup stops at a hundred matches worldwide, which
+            // few Vietnamese companies ever make, and it knows only Ho Chi Minh's.
+            var exact = yield ssi_hit (text);   // the ticker itself, priced by SSI whatever its board
+            if (exact != null) hits += exact;
+            yield load_vietnam ();
+            var code = text.up ();
+            // Tickers that start with what was typed, then anything whose names match it.
+            for (int pass = 0; vietnam != null && pass < 2; pass++) {
+                for (int i = 0; i < vietnam.length && hits.length < 6; i++) {
+                    var listed = vietnam[i];
+                    bool starts = listed.symbol.has_prefix (code);
+                    bool match = starts;
+                    if (pass == 1) match = !starts && text.match_string (listed.words, true);
+                    if (!match || (exact != null && exact.symbol == listed.symbol)) continue;
+                    hits += new Hit () { symbol = listed.symbol, name = listed.name, detail = @"$(listed.board) · Vietnam", currency = "VND" };
+                }
+            }
+            if (vietnam != null) {
+                yield price_hits (hits);   // Yahoo can price the Ho Chi Minh ones; the others go without
+                return hits;
+            }
+            foreach (var hit in hits) industries += "";   // no list (offline?): fall back on Yahoo's lookup
+        }
+        try {
+            var type = market.has_prefix ("=") ? market.substring (1) : "all";
+            var root = yield get_json (@"$YAHOO/v1/finance/lookup?query=$(Uri.escape_string (text))&type=$type&count=100&start=0&formatted=false&fetchPricingData=false&lang=en-US&region=US");
+            var result = root.has_member ("finance") && root.get_object_member ("finance").has_member ("result") && !root.get_object_member ("finance").get_null_member ("result")
+                ? root.get_object_member ("finance").get_array_member ("result") : new Json.Array ();
+            var found = result.get_length () > 0 && result.get_object_element (0).has_member ("documents")
+                ? result.get_object_element (0).get_array_member ("documents") : new Json.Array ();
+            for (uint i = 0; i < found.get_length () && hits.length < 6; i++) {
+                var o = found.get_object_element (i);
+                var symbol = o.get_string_member_with_default ("symbol", "");
+                var kind = o.get_string_member_with_default ("quoteType", "").up ();
+                bool there = market.has_prefix ("=");   // the lookup was asked for that type alone
+                if (market.has_prefix (".")) there = symbol.has_suffix (market);
+                if (market == "US") there = !symbol.contains (".") && (kind == "EQUITY" || kind == "ETF" || kind == "MUTUALFUND");
+                if (symbol == "" || !there || (hits.length > 0 && hits[0].symbol == symbol)) continue;
+                // Its name: the full one for a US security if we have it, else Yahoo's long name, which
+                // price_hits fetches along with the exchange; the lookup's own is cut short at 31 letters.
+                string? full = names != null ? names[symbol] : null;
+                hits += new Hit () { symbol = symbol, name = full ?? "" };
+                industries += o.get_string_member_with_default ("industryName", "");
+            }
+            yield price_hits (hits);
+            for (int i = 0; i < hits.length; i++) {
+                if (hits[i].name == "") hits[i].name = hits[i].symbol;
+                if (industries[i] != "") hits[i].detail += " · " + industries[i];
+            }
+        } catch (Error e) {}
+        return hits;
+    }
+
     async void price_hits (Hit[] hits) {
         string[] symbols = {};
         foreach (var hit in hits) if (!hit.price.is_finite ()) symbols += hit.symbol;
@@ -248,10 +400,10 @@ public class Feed {
                 hit.currency = o.get_string_member_with_default ("currency", "");
                 hit.price = o.get_double_member_with_default ("regularMarketPrice", double.NAN);
                 hit.cap = o.get_double_member_with_default ("marketCap", double.NAN);   // funds and warrants have none
-                if (hit.name == "") {   // a pair we guessed the symbol of, rather than a search result
-                    hit.name = o.get_string_member_with_default ("longName", o.get_string_member_with_default ("shortName", hit.symbol));
-                    hit.detail = "%s · %s".printf (o.get_string_member_with_default ("fullExchangeName", ""), o.get_string_member_with_default ("typeDisp", ""));
-                }
+                // Hits that didn't come from the search endpoint arrive without these: a pair whose
+                // symbol we guessed, or a lookup result (which may bring a better name of its own).
+                if (hit.name == "") hit.name = o.get_string_member_with_default ("longName", o.get_string_member_with_default ("shortName", hit.symbol));
+                if (hit.detail == "") hit.detail = "%s · %s".printf (o.get_string_member_with_default ("fullExchangeName", ""), o.get_string_member_with_default ("typeDisp", ""));
             }
         }
     }

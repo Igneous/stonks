@@ -17,13 +17,14 @@ public class Cache {
         db.exec ("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL");
         var version = query ("PRAGMA user_version");
         if (version != null && version.step () == Sqlite.ROW && version.column_int (0) != VERSION)
-            db.exec (@"DROP TABLE IF EXISTS quotes; DROP TABLE IF EXISTS bars; DROP TABLE IF EXISTS names; DROP TABLE IF EXISTS facts; DROP TABLE IF EXISTS logos; PRAGMA user_version = $VERSION");
+            db.exec (@"DROP TABLE IF EXISTS quotes; DROP TABLE IF EXISTS bars; DROP TABLE IF EXISTS names; DROP TABLE IF EXISTS facts; DROP TABLE IF EXISTS logos; DROP TABLE IF EXISTS kept; PRAGMA user_version = $VERSION");
         db.exec ("""
             CREATE TABLE IF NOT EXISTS quotes (symbol TEXT PRIMARY KEY, name TEXT, currency TEXT, kind TEXT, gmtoffset INTEGER, checked INTEGER) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS bars (symbol TEXT, intraday INTEGER, t INTEGER, close REAL, PRIMARY KEY (symbol, intraday, t)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS names (symbol TEXT PRIMARY KEY, name TEXT) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS facts (key TEXT PRIMARY KEY, value INTEGER) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS logos (symbol TEXT PRIMARY KEY, image BLOB) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS kept (key TEXT PRIMARY KEY, fetched INTEGER, body BLOB);
         """);
     }
 
@@ -107,6 +108,28 @@ public class Cache {
         var rows = query ("SELECT symbol, name FROM names");
         while (rows.step () == Sqlite.ROW) names[rows.column_text (0)] = rows.column_text (1);
         return names.size () > 0 ? names : null;
+    }
+
+    // A download kept whole under a name (a symbol directory, say), or null if we have none or it is
+    // older than max_age seconds.
+    public Bytes? kept (string key, int64 max_age, int64 now) {
+        if (db == null) return null;
+        var row = query ("SELECT body FROM kept WHERE key = ? AND fetched >= ?");
+        row.bind_text (1, key);
+        row.bind_int64 (2, now - max_age);
+        if (row.step () != Sqlite.ROW || row.column_bytes (0) == 0) return null;
+        unowned uint8[] body = (uint8[]) row.column_blob (0);
+        body.length = row.column_bytes (0);
+        return new Bytes (body);
+    }
+
+    public void keep (string key, Bytes body, int64 now) {
+        if (db == null) return;
+        var put = query ("INSERT OR REPLACE INTO kept (key, fetched, body) VALUES (?, ?, ?)");
+        put.bind_text (1, key);
+        put.bind_int64 (2, now);
+        put.bind_blob (3, body.get_data (), (int) body.get_size ());
+        put.step ();
     }
 
     // A symbol's logo, as the image file's bytes. `known` tells "never looked" (false) from "looked, and

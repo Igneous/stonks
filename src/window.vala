@@ -625,10 +625,19 @@ public class Window : Adw.ApplicationWindow {
             css_classes = { "flat" }, popover = new Gtk.Popover () { child = calendar }
         });
         var hits = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" }, visible = false, margin_top = 12 };
+        // Beside the search field: keep the search to one market. "Auto" searches everywhere.
+        var markets = new Gtk.StringList (null);
+        for (int i = 0; i < Feed.MARKETS.length; i += 2) markets.append (Feed.MARKETS[i]);
+        var market = new Gtk.DropDown (markets, new Gtk.PropertyExpression (typeof (Gtk.StringObject), null, "string")) {
+            enable_search = true, search_match_mode = Gtk.StringFilterMatchMode.SUBSTRING,
+            valign = Gtk.Align.CENTER, tooltip_text = "Search within one market"
+        };
+        symbol.add_suffix (market);
+        market.notify["selected"].connect (() => { Signal.emit_by_name (symbol, "changed"); });   // search again, there
 
         var stock = new Adw.PreferencesGroup () {
             title = "Stock",
-            description = "Search by name or ticker: AAPL, 7203.T, 005930.KS, 600519.SS, or PVS.VN for any Vietnamese exchange."
+            description = "Search by name or ticker: AAPL, 7203.T, 005930.KS, 600519.SS, or PVS.VN for any Vietnamese exchange. Pick a market beside the field to search only there."
         };
         stock.add (symbol);
         stock.add (hits);
@@ -676,7 +685,7 @@ public class Window : Adw.ApplicationWindow {
                 return;
             }
             Timeout.add (250, () => {
-                if (mine == serial) feed.search.begin (text, p.currency, (obj, res) => {
+                if (mine == serial) feed.search.begin (text, p.currency, Feed.MARKETS[market.selected * 2 + 1], (obj, res) => {
                     var found = feed.search.end (res);
                     if (mine != serial) return;
                     hits.remove_all ();
