@@ -17,12 +17,13 @@ public class Cache {
         db.exec ("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL");
         var version = query ("PRAGMA user_version");
         if (version != null && version.step () == Sqlite.ROW && version.column_int (0) != VERSION)
-            db.exec (@"DROP TABLE IF EXISTS quotes; DROP TABLE IF EXISTS bars; DROP TABLE IF EXISTS names; DROP TABLE IF EXISTS facts; PRAGMA user_version = $VERSION");
+            db.exec (@"DROP TABLE IF EXISTS quotes; DROP TABLE IF EXISTS bars; DROP TABLE IF EXISTS names; DROP TABLE IF EXISTS facts; DROP TABLE IF EXISTS logos; PRAGMA user_version = $VERSION");
         db.exec ("""
             CREATE TABLE IF NOT EXISTS quotes (symbol TEXT PRIMARY KEY, name TEXT, currency TEXT, kind TEXT, gmtoffset INTEGER, checked INTEGER) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS bars (symbol TEXT, intraday INTEGER, t INTEGER, close REAL, PRIMARY KEY (symbol, intraday, t)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS names (symbol TEXT PRIMARY KEY, name TEXT) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS facts (key TEXT PRIMARY KEY, value INTEGER) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS logos (symbol TEXT PRIMARY KEY, image BLOB) WITHOUT ROWID;
         """);
     }
 
@@ -106,6 +107,36 @@ public class Cache {
         var rows = query ("SELECT symbol, name FROM names");
         while (rows.step () == Sqlite.ROW) names[rows.column_text (0)] = rows.column_text (1);
         return names.size () > 0 ? names : null;
+    }
+
+    // A symbol's logo, as the image file's bytes. `known` tells "never looked" (false) from "looked, and
+    // there is none" (true, with null): either way a known symbol is not looked up again.
+    public Bytes? logo (string symbol, out bool known) {
+        known = false;
+        if (db == null) return null;
+        var row = query ("SELECT image FROM logos WHERE symbol = ?");
+        row.bind_text (1, symbol);
+        if (row.step () != Sqlite.ROW) return null;
+        known = true;
+        int size = row.column_bytes (0);
+        if (size == 0) return null;
+        unowned uint8[] image = (uint8[]) row.column_blob (0);
+        image.length = size;
+        return new Bytes (image);
+    }
+
+    // Remember a symbol's logo for good; null records that it has none.
+    public void save_logo (string symbol, Bytes? image) {
+        if (db == null) return;
+        var put = query ("INSERT OR REPLACE INTO logos (symbol, image) VALUES (?, ?)");
+        put.bind_text (1, symbol);
+        if (image != null) put.bind_blob (2, image.get_data (), (int) image.get_size ());
+        put.step ();
+    }
+
+    // Forget every logo, found or not, so they are all looked up afresh.
+    public void forget_logos () {
+        if (db != null) db.exec ("DELETE FROM logos");
     }
 
     public void save_names (HashTable<string, string> names, int64 now) {

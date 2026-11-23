@@ -8,7 +8,8 @@
 //                   Drop-in alternatives that returned identical bars when this was written:
 //                   services.entrade.com.vn/chart-api/v2/ohlcs/stock and dchart-api.vndirect.com.vn/dchart/history.
 //
-// Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities.
+// Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities, and
+// logos come from wherever logo() says.
 //
 // Being a polite guest of all three: everything fetched goes into the on-disk Cache, so a symbol's
 // whole history is downloaded once and after that only the bars since the last ones we have; a quote
@@ -85,7 +86,7 @@ public class Feed {
 
     // A symbol from scratch: its whole daily history and the last week of 5-minute bars. The one big
     // download per symbol; afterwards it lives in the cache.
-    public async Quote fetch (string symbol) throws Error {
+    public async Quote download (string symbol) throws Error {
         var now = get_real_time () / 1000000;
         Quote q;
         if (from_ssi (symbol)) q = yield fetch_ssi (symbol); else q = yield fetch_yahoo (symbol);
@@ -255,20 +256,139 @@ public class Feed {
         }
     }
 
-    // Yahoo's quote endpoint for several symbols at once; null if it can't be had right now.
-    async Json.Array? quote_batch (string[] symbols, string fields) {
-        if (symbols.length == 0) return null;
+    // A Yahoo endpoint that wants the cookie-and-crumb handshake (no account involved: Yahoo hands both
+    // to anyone who asks). `url` ends in its query string. Null if it can't be had right now.
+    async Json.Object? authed (string url) {
         try {
             if (crumb == null) {
                 yield session.send_and_read_async (new Soup.Message ("GET", "https://fc.yahoo.com"), Priority.DEFAULT, null);   // a 404 that sets the cookie
                 var reply = yield session.send_and_read_async (new Soup.Message ("GET", "https://query2.finance.yahoo.com/v1/test/getcrumb"), Priority.DEFAULT, null);
                 crumb = reply.get_size () > 0 ? ((string) reply.get_data ()).substring (0, (long) reply.get_size ()) : "";
             }
-            var root = yield get_json (@"$YAHOO/v7/finance/quote?fields=$fields&crumb=$(Uri.escape_string (crumb))&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
-            if (root.has_member ("quoteResponse")) return root.get_object_member ("quoteResponse").get_array_member ("result");
+            var root = yield get_json (@"$url&crumb=$(Uri.escape_string (crumb))");
+            if (!root.has_member ("finance")) return root;   // {"finance": {"error": ...}} is the refusal
         } catch (Error e) {}
         crumb = null;   // refused or unreachable: the crumb may have gone stale, so get a new one next time
         return null;
+    }
+
+    // Yahoo's quote endpoint for several symbols at once; null if it can't be had right now.
+    async Json.Array? quote_batch (string[] symbols, string fields) {
+        if (symbols.length == 0) return null;
+        var root = yield authed (@"$YAHOO/v7/finance/quote?fields=$fields&symbols=$(Uri.escape_string (string.joinv (",", symbols), ",="))");
+        return root != null && root.has_member ("quoteResponse") ? root.get_object_member ("quoteResponse").get_array_member ("result") : null;
+    }
+
+    // ---- Logos ----
+    // Looked up once per symbol and then kept for good, "there is none" included: nothing here is
+    // asked for a second time unless the user says to (forget_logos).
+
+    // What the cache has: the image file's bytes, or null. `known` is whether we ever looked.
+    public Bytes? cached_logo (string symbol, out bool known) {
+        return cache.logo (symbol, out known);
+    }
+
+    public void forget_logos () {
+        cache.forget_logos ();
+    }
+
+    // Record that what we found for a symbol is no use (not an image we can draw), so it isn't fetched again.
+    public void no_logo (string symbol) {
+        cache.save_logo (symbol, null);
+    }
+
+    // Find a symbol's logo and remember the answer. Null if it has none; throws if we couldn't find out,
+    // in which case nothing is remembered and it can be tried another day.
+    //   a Vietnamese ticker   Simplize's logo CDN, by ticker
+    //   a coin                the image Yahoo's quote links to
+    //   a company             the best icon its own website declares; Yahoo's profile says which site
+    //   anything else         none, without asking anyone: indices, funds and pairs have no site of their own
+    public async Bytes? logo (string symbol, string kind) throws Error {
+        Bytes? image = null;
+        if (from_ssi (symbol)) {
+            if (!symbol.has_prefix ("^")) image = yield image_at (@"https://cdn.simplize.vn/simplizevn/logo/$(Uri.escape_string (ssi_code (symbol))).jpeg");
+        } else if (kind == "CRYPTOCURRENCY") {
+            var quotes = yield quote_batch ({ symbol }, "logoUrl");
+            if (quotes == null) throw new IOError.FAILED ("Yahoo's quote can't be reached");
+            if (quotes.get_length () > 0) image = yield image_at (quotes.get_object_element (0).get_string_member_with_default ("logoUrl", ""));
+        } else if (kind == "EQUITY" || kind == "") {
+            image = yield site_icon (symbol);
+        }
+        cache.save_logo (symbol, image);
+        return image;
+    }
+
+    // The icon of the company's own website. Yahoo's profile names the site; the site's front page says
+    // where its icons are. Two requests to the company at most, once.
+    async Bytes? site_icon (string symbol) throws Error {
+        var root = yield authed (@"$YAHOO/v10/finance/quoteSummary/$(Uri.escape_string (symbol, "="))?modules=assetProfile");
+        if (root == null) throw new IOError.FAILED ("Yahoo's company profile can't be reached");
+        string site = "";
+        var summary = root.has_member ("quoteSummary") ? root.get_object_member ("quoteSummary") : null;
+        if (summary != null && summary.has_member ("result") && !summary.get_null_member ("result")) {
+            var result = summary.get_array_member ("result");
+            if (result.get_length () > 0 && result.get_object_element (0).has_member ("assetProfile"))
+                site = result.get_object_element (0).get_object_member ("assetProfile").get_string_member_with_default ("website", "");
+        }
+        if (site == "") return null;
+        // Yahoo answered, so the network is fine: if the company's site won't play, that is its answer.
+        try {
+            string where = site, icon = "/favicon.ico";
+            var page = yield fetch (site, out where);
+            if (page != null) icon = best_icon (((string) page.get_data ()).substring (0, (long) page.get_size ()));
+            var image = yield image_at (Uri.resolve_relative (where, icon, UriFlags.NONE));
+            if (image == null && icon != "/favicon.ico") image = yield image_at (Uri.resolve_relative (where, "/favicon.ico", UriFlags.NONE));
+            return image;
+        } catch (Error e) {
+            return null;
+        }
+    }
+
+    // The best icon a page declares: an apple-touch-icon if it has one (large, and drawn to stand on its
+    // own), otherwise its largest rel=icon, otherwise the conventional /favicon.ico.
+    static string best_icon (string html) {
+        string best = "/favicon.ico";
+        int best_score = -1;
+        try {
+            // RAW: pages are not always the UTF-8 they claim to be.
+            var link = new Regex ("<link\\b[^>]*>", RegexCompileFlags.CASELESS | RegexCompileFlags.RAW);
+            var rel = new Regex ("\\brel\\s*=\\s*[\"']?([^\"'>]+)", RegexCompileFlags.CASELESS | RegexCompileFlags.RAW);
+            var href = new Regex ("\\bhref\\s*=\\s*[\"']?([^\"'\\s>]+)", RegexCompileFlags.CASELESS | RegexCompileFlags.RAW);
+            var sizes = new Regex ("\\bsizes\\s*=\\s*[\"']?(\\d+)", RegexCompileFlags.CASELESS | RegexCompileFlags.RAW);
+            MatchInfo tag, r, h, n;
+            for (link.match (html, 0, out tag); tag.matches (); tag.next ()) {
+                var text = tag.fetch (0);
+                if (!rel.match (text, 0, out r)) continue;
+                if (!href.match (text, 0, out h)) continue;
+                var kind = r.fetch (1).down ();
+                if (!kind.contains ("icon") || kind.contains ("mask")) continue;
+                int score = kind.contains ("apple-touch") ? 1000 : 0;
+                if (sizes.match (text, 0, out n)) score += int.parse (n.fetch (1));
+                if (h.fetch (1).down ().contains (".svg")) score -= 2000;   // only if nothing else: not every system can draw one
+                if (score > best_score) {
+                    best_score = score;
+                    best = h.fetch (1).replace ("&amp;", "&");
+                }
+            }
+        } catch (Error e) {}
+        return best;
+    }
+
+    // The body of a page that answered 200, and where it ended up after redirects; null otherwise.
+    async Bytes? fetch (string url, out string where) throws Error {
+        where = url;
+        var msg = new Soup.Message ("GET", url);
+        if (msg == null) return null;   // not a URL
+        var body = yield session.send_and_read_async (msg, Priority.DEFAULT, null);
+        where = msg.uri.to_string ();
+        return msg.status_code == 200 && body.get_size () > 0 ? body : null;
+    }
+
+    // An image file's bytes, or null if there is no such thing there (or it is implausibly big for a logo).
+    async Bytes? image_at (string url) throws Error {
+        string where;
+        var body = yield fetch (url, out where);
+        return body != null && body.get_size () < 2 * 1024 * 1024 ? body : null;
     }
 
     // Give each hit priced in another currency the rate into `into`, so the list can show both.

@@ -38,6 +38,12 @@ public class Window : Adw.ApplicationWindow {
     Gtk.SingleSelection selection;
     Treemap treemap;
     Matrix matrix;
+    // Logos, by symbol: looked up once each (see want_logo) and then kept in the cache for good.
+    HashTable<string, Gdk.Texture> logos = new HashTable<string, Gdk.Texture> (str_hash, str_equal);
+    GenericSet<string> logo_seen = new GenericSet<string> (str_hash, str_equal);   // dealt with this session
+    GenericArray<string> logo_queue = new GenericArray<string> ();                 // still to be fetched
+    bool logo_busy;
+    bool tile_charts = true;   // the heatmap's background charts; saved with the portfolio
     Gtk.ListBox folders = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" } };
     string folders_shown = "";   // what the sidebar was last built from, see show_folders()
 
@@ -57,6 +63,10 @@ public class Window : Adw.ApplicationWindow {
         var pages = new Adw.ViewStack ();
         var header = new Adw.HeaderBar () { title_widget = new Adw.ViewSwitcher () { stack = pages, policy = Adw.ViewSwitcherPolicy.WIDE } };
         header.pack_start (new Gtk.Button.from_icon_name ("list-add-symbolic") { action_name = "win.add", tooltip_text = "Add stock (Ctrl+N)" });
+        var menu = new Menu ();
+        menu.append ("Charts in Heatmap Tiles", "win.tile-charts");
+        menu.append ("Reload Logos", "win.reload-logos");
+        header.pack_end (new Gtk.MenuButton () { icon_name = "open-menu-symbolic", tooltip_text = "Main menu", primary = true, menu_model = menu });
         header.pack_end (new Gtk.Button.from_icon_name ("view-refresh-symbolic") { action_name = "win.refresh", tooltip_text = "Refresh (Ctrl+R)" });
         var currency = new Gtk.DropDown.from_strings (CURRENCIES) { tooltip_text = "Currency for totals" };
         for (uint i = 0; i < CURRENCIES.length; i++) if (CURRENCIES[i] == p.currency) currency.selected = i;
@@ -109,6 +119,7 @@ public class Window : Adw.ApplicationWindow {
 
         // Heatmap page: the treemap, and a sidebar of folders that the header's toggle shows and hides.
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
+        treemap.charts = tile_charts;
         treemap.dropped.connect ((payload, folder, target, after) => dropped (payload, folder, target, after));
         var side = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         side.append (new Gtk.CenterBox () {
@@ -150,6 +161,27 @@ public class Window : Adw.ApplicationWindow {
         var refresh = new SimpleAction ("refresh", null);
         refresh.activate.connect (() => sync (true, true));
         add_action (refresh);
+
+        // The main menu.
+        var charts = new SimpleAction.stateful ("tile-charts", null, new Variant.boolean (tile_charts));
+        charts.activate.connect (() => {
+            tile_charts = !tile_charts;
+            charts.set_state (new Variant.boolean (tile_charts));
+            treemap.charts = tile_charts;
+            treemap.queue_draw ();
+            save ();
+        });
+        add_action (charts);
+        var reload_logos = new SimpleAction ("reload-logos", null);
+        reload_logos.activate.connect (() => {
+            // The one way a logo is ever fetched twice: because the user asked.
+            feed.forget_logos ();
+            logos.remove_all ();
+            logo_seen.remove_all ();
+            treemap.clear_logos ();
+            update ();
+        });
+        add_action (reload_logos);
 
         // Folder actions; the sidebar's menus carry the folder or stock they act on as the target.
         var new_folder = new SimpleAction ("new-folder", null);
@@ -330,10 +362,57 @@ public class Window : Adw.ApplicationWindow {
         for (int i = 0; i < cells.length; i++) fill (cells[i]);
         view.sorter.changed (Gtk.SorterChange.DIFFERENT);   // prices moved: re-sort
 
+        for (uint i = 0; i < p.lots.get_n_items (); i++) want_logo (((Lot) p.lots.get_item (i)).symbol);
         treemap.range = range;
         treemap.queue_draw ();
         matrix.refresh ();
         show_folders ();
+    }
+
+    // ---- logos ----
+
+    // See to a symbol's logo, once its quote is in (the quote says what kind of thing it is): from the
+    // cache if we ever looked, otherwise it joins the queue to be fetched.
+    void want_logo (string symbol) {
+        if (logo_seen.contains (symbol) || !p.quotes.contains (symbol)) return;
+        logo_seen.add (symbol);
+        bool known;
+        var image = feed.cached_logo (symbol, out known);
+        if (image != null) show_logo (symbol, image);
+        if (known) return;
+        logo_queue.add (symbol);
+        fetch_logos.begin ();
+    }
+
+    // False if the bytes are not an image we can draw.
+    bool show_logo (string symbol, Bytes image) {
+        try {
+            var texture = Gdk.Texture.from_bytes (image);
+            logos[symbol] = texture;
+            treemap.set_logo (symbol, texture);
+            return true;
+        } catch (Error e) {
+            return false;
+        }
+    }
+
+    // Fetch the logos still missing, one after another: there is no hurry, and the sites are not ours.
+    async void fetch_logos () {
+        if (logo_busy) return;
+        logo_busy = true;
+        while (logo_queue.length > 0) {
+            string symbol = logo_queue[0];
+            logo_queue.remove_index (0);
+            var q = p.quotes[symbol];
+            try {
+                var image = yield feed.logo (symbol, q != null ? q.kind : "");
+                if (image != null && !show_logo (symbol, image)) feed.no_logo (symbol);
+                show_folders ();
+            } catch (Error e) {
+                // Couldn't find out (offline, say). Nothing was recorded, so the next launch asks again.
+            }
+        }
+        logo_busy = false;
     }
 
     // ---- heatmap folders ----
@@ -374,7 +453,7 @@ public class Window : Adw.ApplicationWindow {
         var shape = new StringBuilder ();
         for (int i = 0; i < p.groups.length; i++) shape.append (p.groups[i] + "\n");
         for (int i = 0; i < tiles.length; i++)
-            if (tiles[i].kind == TileKind.STOCK) shape.append ("%s\t%s\t%s\n".printf (tiles[i].symbol, tiles[i].group, tiles[i].name));
+            if (tiles[i].kind == TileKind.STOCK) shape.append ("%s\t%s\t%s\t%d\n".printf (tiles[i].symbol, tiles[i].group, tiles[i].name, (int) logos.contains (tiles[i].symbol)));
         if (shape.str == folders_shown) return;
         folders_shown = shape.str;
         folders.remove_all ();
@@ -421,6 +500,7 @@ public class Window : Adw.ApplicationWindow {
                 var destinations = new Menu ();
                 destinations.append_section ("Move to", targets);
                 var row = new Adw.ActionRow () { use_markup = false, title = t.symbol, subtitle = t.name, subtitle_lines = 1 };
+                if (logos.contains (t.symbol)) row.add_prefix (new Gtk.Image.from_paintable (logos[t.symbol]) { pixel_size = 24 });
                 // Drag the row onto a folder here, or onto a folder's block in the heatmap.
                 var drag = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
                 unowned Gtk.DragSource source = drag;   // unowned, or the handler below would keep
@@ -496,7 +576,7 @@ public class Window : Adw.ApplicationWindow {
                 q = feed.cached (symbol);
                 if (q != null) p.quotes[symbol] = q;   // shown as it was, even if the refresh below fails
             }
-            if (q == null) p.quotes[symbol] = yield feed.fetch (symbol);
+            if (q == null) p.quotes[symbol] = yield feed.download (symbol);
             else yield feed.refresh (q);
             if (!known) sync ();   // a new holding can need FX pairs we don't have yet
         } catch (Error e) {
@@ -684,7 +764,7 @@ public class Window : Adw.ApplicationWindow {
             return kept;
         }
         peeking.add (symbol);
-        try { p.quotes[symbol] = yield feed.fetch (symbol); } catch (Error e) {}
+        try { p.quotes[symbol] = yield feed.download (symbol); } catch (Error e) {}
         peeking.remove (symbol);
         return p.quotes[symbol];
     }
@@ -764,6 +844,7 @@ public class Window : Adw.ApplicationWindow {
             if (node == null || node.get_node_type () != Json.NodeType.OBJECT) throw new IOError.INVALID_DATA ("not a portfolio");
             var saved = node.get_object ();
             p.currency = saved.get_string_member_with_default ("currency", "USD");
+            tile_charts = saved.get_boolean_member_with_default ("tile_charts", true);
             saved.get_array_member ("lots").foreach_element ((array, i, lot) => {
                 if (lot.get_node_type () == Json.NodeType.OBJECT) p.lots.append (Json.gobject_deserialize (typeof (Lot), lot));
             });
@@ -789,6 +870,7 @@ public class Window : Adw.ApplicationWindow {
         var groups = new Json.Array ();
         for (int i = 0; i < p.groups.length; i++) groups.add_string_element (p.groups[i]);
         saved.set_string_member ("currency", p.currency);
+        saved.set_boolean_member ("tile_charts", tile_charts);
         saved.set_array_member ("groups", groups);
         saved.set_array_member ("lots", lots);
         var node = new Json.Node (Json.NodeType.OBJECT);

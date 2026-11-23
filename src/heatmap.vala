@@ -15,6 +15,8 @@ int64 now_s () { return get_real_time () / 1000000; }
 
 public class Treemap : Gtk.DrawingArea {
     public Range range;
+    public bool charts = true;   // draw each tile's price over the range behind its label
+    HashTable<string, Cairo.ImageSurface> logos = new HashTable<string, Cairo.ImageSurface> (str_hash, str_equal);
     // Something was dropped: a symbol, or "folder:" and a folder's name. `folder` is the folder it
     // landed in; `target`, if any, the symbol it was dropped on, to go before or `after` it.
     public signal void dropped (string payload, string folder, string? target, bool after);
@@ -86,6 +88,87 @@ public class Treemap : Gtk.DrawingArea {
             }
             return false;
         });
+    }
+
+    // Give a symbol's tile a logo to show (null takes it away again).
+    public void set_logo (string symbol, Gdk.Texture? texture) {
+        logos.remove (symbol);
+        if (texture != null) {
+            var surface = new Cairo.ImageSurface (Cairo.Format.ARGB32, texture.width, texture.height);
+            texture.download (surface.get_data (), surface.get_stride ());
+            surface.mark_dirty ();
+            logos[symbol] = surface;
+        }
+        queue_draw ();
+    }
+
+    public void clear_logos () {
+        logos.remove_all ();
+        queue_draw ();
+    }
+
+    // The tile's price over the range, as a faint line and wash behind everything else on it.
+    void chart (Cairo.Context cr, Tile t) {
+        var q = p.quotes[t.symbol];
+        if (q == null || t.w < 30 || t.h < 30) return;
+        var s = q.view (range, now_s ());
+        if (s.n < 2) return;
+        int step = int.max (1, (int) (s.n / (t.w / 2)));   // a point every two pixels is as fine as it can show
+        double lo = s.v[0], hi = s.v[0];
+        foreach (double v in s.v) { lo = double.min (lo, v); hi = double.max (hi, v); }
+        if (hi <= lo) return;
+        double left = t.x + 1, width = t.w - 2, top = t.y + t.h * 0.12, height = t.h * 0.8;
+        cr.save ();
+        cr.rectangle (t.x + 1, t.y + 1, t.w - 2, t.h - 2);
+        cr.clip ();
+        cr.move_to (left, top + height * (hi - s.v[0]) / (hi - lo));
+        for (int i = step; i < s.n - 1; i += step) cr.line_to (left + width * i / (s.n - 1), top + height * (hi - s.v[i]) / (hi - lo));
+        cr.line_to (left + width, top + height * (hi - s.v[s.n - 1]) / (hi - lo));
+        var line = cr.copy_path ();
+        cr.line_to (left + width, t.y + t.h);
+        cr.line_to (left, t.y + t.h);
+        cr.close_path ();
+        cr.set_source_rgba (1, 1, 1, 0.09);
+        cr.fill ();
+        cr.append_path (line);
+        cr.set_source_rgba (1, 1, 1, 0.32);
+        cr.set_line_width (1.5);
+        cr.set_line_join (Cairo.LineJoin.ROUND);
+        cr.stroke ();
+        cr.restore ();
+    }
+
+    // The tile's logo in its top left corner (beside the label in the top row), if it has one and
+    // there is room for it without crowding the label.
+    void logo (Cairo.Context cr, Tile t) {
+        var image = logos[t.symbol];
+        if (image == null) return;
+        double size = (double.min (t.w, t.h) * 0.2).clamp (16, 40), x = t.x + 8, y = t.y + 8;
+        if (t.kind == TileKind.BENCHMARK) {
+            size = 24;
+            y = t.y + (t.h - size) / 2;
+            if (t.w < 200) return;
+        } else if (t.w < size * 3.2 || t.h < size * 3.2) {
+            return;
+        }
+        double r = size * 0.22;
+        cr.save ();
+        cr.new_sub_path ();
+        cr.arc (x + size - r, y + r, r, -Math.PI / 2, 0);
+        cr.arc (x + size - r, y + size - r, r, 0, Math.PI / 2);
+        cr.arc (x + r, y + size - r, r, Math.PI / 2, Math.PI);
+        cr.arc (x + r, y + r, r, Math.PI, Math.PI * 1.5);
+        cr.close_path ();
+        cr.clip ();
+        // On a white plate: most logos are drawn for a white page and vanish on a red or green tile.
+        cr.set_source_rgb (1, 1, 1);
+        cr.paint ();
+        cr.translate (x, y);
+        cr.scale (size / image.get_width (), size / image.get_height ());
+        cr.set_source_surface (image, 0, 0);
+        cr.get_source ().set_filter (Cairo.Filter.GOOD);
+        cr.paint ();
+        cr.restore ();
     }
 
     // Where a dragged thing would land at (x, y): `spot` is the tile it would go beside (null if it
@@ -174,6 +257,8 @@ public class Treemap : Gtk.DrawingArea {
             heat (cr, t.change, range);
             cr.rectangle (t.x + 1, t.y + 1, t.w - 2, t.h - 2);
             cr.fill ();
+            if (charts) chart (cr, t);
+            logo (cr, t);
             if (any_held && t.kind == TileKind.STOCK && t.value <= 0) {
                 // Watched next to real holdings: a dashed outline says this tile's size isn't money.
                 cr.set_source_rgba (1, 1, 1, 0.55);
