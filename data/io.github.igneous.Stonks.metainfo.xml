@@ -38,19 +38,19 @@
   <screenshots>
     <screenshot type="default">
       <caption>A day's moves across everything you follow</caption>
-      <image>https://raw.githubusercontent.com/igneous/stonks/v0.1.0/data/screenshots/heatmap.png</image>
+      <image>https://raw.githubusercontent.com/igneous/stonks/ac507849ea7547e2cec36afdac6452efcbb890c2/data/screenshots/heatmap.png</image>
     </screenshot>
     <screenshot>
       <caption>One stock, with its chart and key figures</caption>
-      <image>https://raw.githubusercontent.com/igneous/stonks/v0.1.0/data/screenshots/stock.png</image>
+      <image>https://raw.githubusercontent.com/igneous/stonks/ac507849ea7547e2cec36afdac6452efcbb890c2/data/screenshots/stock.png</image>
     </screenshot>
     <screenshot>
-      <caption>How the whole portfolio has done</caption>
-      <image>https://raw.githubusercontent.com/igneous/stonks/v0.1.0/data/screenshots/performance.png</image>
+      <caption>Every symbol across every range</caption>
+      <image>https://raw.githubusercontent.com/igneous/stonks/ac507849ea7547e2cec36afdac6452efcbb890c2/data/screenshots/performance.png</image>
     </screenshot>
   </screenshots>
   <releases>
-    <release version="0.1.0" date="2026-11-23">
+    <release version="0.1.0" date="2026-11-24">
       <description>
         <p>First release.</p>
       </description>
