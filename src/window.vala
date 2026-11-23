@@ -10,7 +10,7 @@ const int COL_GAIN = 9;
 
 public class Window : Adw.ApplicationWindow {
     Portfolio p = new Portfolio ();
-    Feed feed = new Feed ();
+    Feed feed = new Feed (new Cache (Path.build_filename (Environment.get_user_cache_dir (), "stonks", "cache.db")));
     Range range = Range.D1;
     string path = Path.build_filename (Environment.get_user_data_dir (), "stonks", "portfolio.json");
     GenericSet<string> loading = new GenericSet<string> (str_hash, str_equal);
@@ -44,6 +44,14 @@ public class Window : Adw.ApplicationWindow {
     public Window (Adw.Application app) {
         Object (application: app, title: "Stonks", default_width: 1240, default_height: 820);
         load ();
+        // Start from what the cache holds, so the window is complete at once and works offline; sync()
+        // then asks the feeds only for what is new. Two passes: the first reveals which FX pairs are needed.
+        for (int pass = 0; pass < 2; pass++) {
+            foreach (var symbol in p.wanted ()) {
+                var q = p.quotes.contains (symbol) ? null : feed.cached (symbol);
+                if (q != null) p.quotes[symbol] = q;
+            }
+        }
 
         // Header bar: add, page switcher, totals currency, refresh.
         var pages = new Adw.ViewStack ();
@@ -435,27 +443,32 @@ public class Window : Adw.ApplicationWindow {
 
     // ---- quotes ----
 
-    // Load quotes for everything we hold or convert through. `all` also refreshes the ones we already
-    // have; `full` refetches their whole history instead of just the latest bars.
-    void sync (bool all = false, bool full = false) {
+    // Load quotes for everything we track or convert through. `all` also refreshes the ones we already
+    // have, but only those that are due (see Quote.due); `force` refreshes them regardless.
+    void sync (bool all = false, bool force = false) {
+        var now = now_s ();
         foreach (var symbol in p.wanted ()) {
-            bool have = p.quotes.contains (symbol);
-            if (!loading.contains (symbol) && (all || !have)) load_symbol.begin (symbol, full || !have);
+            var q = p.quotes[symbol];
+            // A pair we only convert totals through needn't be to the minute: a quarter of an hour will do.
+            bool due = q != null && (p.tracks (symbol) ? q.due (now) : now - q.refreshed >= 900);
+            if (!loading.contains (symbol) && (q == null || (all && (force || due)))) load_symbol.begin (symbol);
         }
     }
 
     // `asked`: the user is waiting on this symbol, so always say why it failed.
-    async void load_symbol (string symbol, bool full, bool asked = false) {
+    async void load_symbol (string symbol, bool asked = false) {
         loading.add (symbol);
         status.label = "Updating…";
         try {
             var q = p.quotes[symbol];
-            if (q == null || full) {
-                p.quotes[symbol] = yield feed.fetch (symbol);
-                if (q == null) sync ();   // a new holding can need FX pairs we don't have yet
-            } else {
-                yield feed.refresh (q);
+            bool known = q != null;
+            if (q == null) {
+                q = feed.cached (symbol);
+                if (q != null) p.quotes[symbol] = q;   // shown as it was, even if the refresh below fails
             }
+            if (q == null) p.quotes[symbol] = yield feed.fetch (symbol);
+            else yield feed.refresh (q);
+            if (!known) sync ();   // a new holding can need FX pairs we don't have yet
         } catch (Error e) {
             if (asked || !failing) fail (@"$symbol: $(e.message)");   // background refreshes report an outage once
             if (!asked) round_failed = true;
@@ -635,6 +648,11 @@ public class Window : Adw.ApplicationWindow {
     // complaint if that fails (Add will say why). Null while another peek for it is on its way.
     async Quote? peek (string symbol) {
         if (p.quotes.contains (symbol) || peeking.contains (symbol)) return p.quotes[symbol];
+        var kept = feed.cached (symbol);   // good enough to price a past date; sync() freshens it once added
+        if (kept != null) {
+            p.quotes[symbol] = kept;
+            return kept;
+        }
         peeking.add (symbol);
         try { p.quotes[symbol] = yield feed.fetch (symbol); } catch (Error e) {}
         peeking.remove (symbol);
@@ -660,7 +678,7 @@ public class Window : Adw.ApplicationWindow {
     }
 
     async void add_lot (Lot lot) {
-        if (!p.quotes.contains (lot.symbol)) yield load_symbol (lot.symbol, true, true);
+        if (!p.quotes.contains (lot.symbol)) yield load_symbol (lot.symbol, true);
         var q = p.quotes[lot.symbol];
         if (q == null) {
             add_dialog (lot);   // load_symbol already said why; let them fix the symbol

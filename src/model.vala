@@ -11,8 +11,40 @@ public class Series {
     public unowned int64[] t { get { return _t; } }
     public unowned double[] v { get { return _v; } }
     public int n { get { return _t.length; } }
+    public int unsaved;   // points from this index on are not in the on-disk cache yet (see Cache)
 
     public void add (int64 ts, double val) { _t += ts; _v += val; }
+
+    // Replace the newest value: the live bar moves with every refresh.
+    public void set_last (double val) {
+        _v[n - 1] = val;
+        unsaved = int.min (unsaved, n - 1);
+    }
+
+    // Take over from a fresher stretch: everything of ours from its first point on is replaced by it.
+    public void merge (Series fresh) {
+        if (fresh.n == 0) return;
+        int keep = before (fresh.t[0]) + 1;
+        _t.resize (keep);
+        _v.resize (keep);
+        for (int i = 0; i < fresh.n; i++) add (fresh.t[i], fresh.v[i]);
+        unsaved = int.min (unsaved, keep);
+    }
+
+    // Whether a re-fetched stretch of daily history still says what ours does: every day the two share
+    // (its last aside, that being the live bar) within 0.01%. A split or a dividend adjustment rewrites
+    // the past, and then they don't. Also false if they share no day at all.
+    public bool agrees (Series fresh, int gmtoffset) {
+        int shared = 0;
+        for (int i = 0; i < fresh.n - 1; i++) {
+            int64 day = (fresh.t[i] + gmtoffset) / 86400;
+            int j = before ((day + 1) * 86400 - gmtoffset);   // our last bar before that day ends
+            if (j < 0 || (t[j] + gmtoffset) / 86400 != day) continue;
+            if (Math.fabs (v[j] / fresh.v[i] - 1) > 1e-4) return false;
+            shared++;
+        }
+        return shared > 0;
+    }
 
     // Index of the last point strictly before ts, or -1.
     public int before (int64 ts) {
@@ -39,6 +71,19 @@ public class Quote {
     public double prev_close = double.NAN;   // previous session's close when the feed states one; NaN = derive it from daily
     public Series daily = new Series ();     // full history, 1d bars; the last bar is the live session
     public Series intra = new Series ();     // last 7 days, 5m bars
+    public int64 opens;                      // the regular session the feed last reported, unix time (0 = unknown)
+    public int64 closes;
+    public int64 refreshed;                  // when we last asked the feed about it
+    public int64 checked;                    // when its daily history was last compared with the feed's
+
+    // Whether it is worth asking the feed about this again: every time while its market is in session,
+    // otherwise only once a quarter of an hour (which is also how a new session gets noticed).
+    public bool due (int64 now) {
+        bool trading = now >= opens - 60 && now <= closes + 600;
+        // Currencies report a session round the clock, weekends included: go by their bars instead.
+        if (closes - opens > 20 * 3600) trading = intra.n > 0 && now - intra.t[intra.n - 1] < 1800;
+        return trading || now - refreshed >= 900;
+    }
 
     // One company's shares, as opposed to an index, a fund, a currency pair or a commodity.
     public bool is_stock { get { return kind == "" || kind == "EQUITY"; } }
@@ -86,7 +131,7 @@ public class Quote {
         price = p;
         int last = daily.n - 1;
         if ((t + gmtoffset) / 86400 > (daily.t[last] + gmtoffset) / 86400) daily.add (t, p);
-        else daily.v[last] = p;
+        else daily.set_last (p);
     }
 
     // FX rate at a moment: 5m bars where they reach, else that day's close.
@@ -103,7 +148,7 @@ public class Quote {
         c.price = scale (price, fx.price, invert);
         for (int i = 0; i < daily.n; i++) c.daily.add (daily.t[i], scale (daily.v[i], fx.daily.at (daily.t[i]), invert));
         for (int i = 0; i < intra.n; i++) c.intra.add (intra.t[i], scale (intra.v[i], fx.rate (intra.t[i]), invert));
-        c.daily.v[c.daily.n - 1] = c.price;   // the live bar is worth what it converts to right now
+        c.daily.set_last (c.price);   // the live bar is worth what it converts to right now
         // Yesterday's close converts at yesterday's rate: reuse the one applied to that daily bar.
         int b = daily.before (start (Range.D1, 0));
         if (b >= 0) c.prev_close = prev_close * c.daily.v[b] / daily.v[b];
@@ -165,6 +210,12 @@ public class Portfolio {
 
     public const double GROUP_HEADER = 22;    // pixels kept free at the top of a folder's region for its label
     public const double BENCHMARK_ROW = 64;   // height of the row along the top
+
+    // Whether a symbol is on the list itself, as opposed to an FX pair we only convert totals through.
+    public bool tracks (string symbol) {
+        for (uint i = 0; i < lots.get_n_items (); i++) if (((Lot) lots.get_item (i)).symbol == symbol) return true;
+        return false;
+    }
 
     // File a symbol (every lot of it) in a folder; "" takes it out.
     public void assign (string symbol, string group) {

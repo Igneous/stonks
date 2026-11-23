@@ -9,6 +9,11 @@
 //                   services.entrade.com.vn/chart-api/v2/ohlcs/stock and dchart-api.vndirect.com.vn/dchart/history.
 //
 // Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities.
+//
+// Being a polite guest of all three: everything fetched goes into the on-disk Cache, so a symbol's
+// whole history is downloaded once and after that only the bars since the last ones we have; a quote
+// is refreshed only when Quote.due() says its market could have moved; and the name directory is
+// fetched once a week.
 namespace Stonks {
 
 // A search result.
@@ -31,8 +36,16 @@ public class Feed {
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
     string? crumb;                      // see quote_batch()
     HashTable<string, double?> per_usd = new HashTable<string, double?> (str_hash, str_equal);   // see rate_hits()
+    HashTable<string, Found> found = new HashTable<string, Found> (str_hash, str_equal);          // see search()
+    Cache cache;
 
-    public Feed () {
+    class Found {
+        public Hit[] hits;
+        public int64 at;
+    }
+
+    public Feed (Cache cache) {
+        this.cache = cache;
         session.add_feature (new Soup.CookieJar ());   // for the cookie quote_batch() needs
     }
 
@@ -64,20 +77,68 @@ public class Feed {
 
     static bool from_ssi (string symbol) { return symbol.has_suffix (".VN"); }
 
-    // A symbol's whole daily history, then its latest bars.
-    public async Quote fetch (string symbol) throws Error {
-        return from_ssi (symbol) ? yield fetch_ssi (symbol) : yield fetch_yahoo (symbol);
+    // A symbol as the cache last had it, without asking anyone; null if it was never fetched.
+    // refresh() brings it up to date.
+    public Quote? cached (string symbol) {
+        return cache.load (symbol, get_real_time () / 1000000);
     }
 
-    // Latest price and the last week of 5-minute bars.
+    // A symbol from scratch: its whole daily history and the last week of 5-minute bars. The one big
+    // download per symbol; afterwards it lives in the cache.
+    public async Quote fetch (string symbol) throws Error {
+        var now = get_real_time () / 1000000;
+        Quote q;
+        if (from_ssi (symbol)) q = yield fetch_ssi (symbol); else q = yield fetch_yahoo (symbol);
+        q.checked = q.refreshed = now;
+        cache.save (q, now);
+        return q;
+    }
+
+    // Bring a quote up to date: the price, and the 5-minute bars since the last ones it has. Twice a
+    // day at most it also makes sure its daily history still matches the feed's.
     public async void refresh (Quote q) throws Error {
+        var now = get_real_time () / 1000000;
+        if (now - q.checked > 12 * 3600) yield catch_up (q, now);
         if (from_ssi (q.symbol)) yield refresh_ssi (q); else yield refresh_yahoo (q);
+        q.refreshed = now;
+        cache.save (q, now);
+    }
+
+    // Fetch the last few days of daily bars and hold them against ours. Normally they agree and any
+    // new days are appended. If a split or a dividend adjustment has rewritten the past, they don't,
+    // and the whole history is downloaded again.
+    async void catch_up (Quote q, int64 now) throws Error {
+        int64 from = q.daily.t[q.daily.n - 1] - 12 * 86400;
+        Series tail;
+        if (from_ssi (q.symbol)) tail = yield ssi_bars (q.symbol, "1D", from); else tail = yield daily_yahoo (q.symbol, from);
+        if (q.daily.agrees (tail, q.gmtoffset)) {
+            q.daily.merge (tail);
+        } else {
+            Quote again;
+            if (from_ssi (q.symbol)) again = yield fetch_ssi (q.symbol); else again = yield fetch_yahoo (q.symbol);
+            q.daily = again.daily;
+            q.intra = again.intra;
+            q.name = again.name;
+            q.currency = again.currency;
+            q.kind = again.kind;
+            q.gmtoffset = again.gmtoffset;
+        }
+        q.checked = now;
+    }
+
+    // From when to ask for 5-minute bars: a little before the last one we have, or a week back.
+    static int64 bars_from (Quote q, int64 now) {
+        int64 week = now - 7 * 86400;
+        return q.intra.n > 0 && q.intra.t[q.intra.n - 1] > week ? q.intra.t[q.intra.n - 1] - 1800 : week;
     }
 
     // Full names of US-listed securities, from Nasdaq Trader's symbol directory. Yahoo calls every share
     // class of a company the same thing ("Alphabet Inc." for GOOG, GOOGL, GOOGM and GOOGN alike); these
-    // say which is which. Two small files, fetched once (the window asks at startup).
+    // say which is which. Two small files, downloaded once a week and kept in the cache.
     public async void load_names () {
+        if (names != null) return;
+        var now = get_real_time () / 1000000;
+        names = cache.load_names (now);
         if (names != null) return;
         var found = new HashTable<string, string> (str_hash, str_equal);
         foreach (var file in new string[] { "nasdaqlisted", "otherlisted" }) {
@@ -92,7 +153,10 @@ public class Feed {
                 }
             } catch (Error e) {}
         }
-        if (found.size () > 0) names = found;   // else offline: try again next time
+        if (found.size () > 0) {   // else offline: try again next time
+            names = found;
+            cache.save_names (found, now);
+        }
     }
 
     // The exact ticker in Vietnam if there is one (on any of its three boards), then up to five Yahoo
@@ -101,8 +165,13 @@ public class Feed {
     // list (trading.vietcap.com.vn/api/price/symbols/getAll has one) filtered here.
     // Prices and market caps come in the security's own currency, with `into` as a second opinion.
     public async Hit[] search (string text, string into) {
+        var now = get_real_time () / 1000000;
+        var key = into + "\n" + text.down ();
+        var seen = found[key];
+        if (seen != null && now - seen.at < 900) return seen.hits;   // typed again within a quarter of an hour
         var hits = yield find (text);
         yield rate_hits (hits, into);
+        found[key] = new Found () { hits = hits, at = now };
         return hits;
     }
 
@@ -263,11 +332,22 @@ public class Feed {
         return q;
     }
 
+    async Series daily_yahoo (string symbol, int64 from) throws Error {
+        var now = get_real_time () / 1000000;
+        var result = yield chart (symbol, @"period1=$from&period2=$now&interval=1d");
+        return closes (result);
+    }
+
     async void refresh_yahoo (Quote q) throws Error {
         var now = get_real_time () / 1000000;
-        var result = yield chart (q.symbol, @"period1=$(now - 7 * 86400)&period2=$now&interval=5m");
+        var result = yield chart (q.symbol, @"period1=$(bars_from (q, now))&period2=$now&interval=5m");
         var meta = result.get_object_member ("meta");
-        q.intra = closes (result);
+        q.intra.merge (closes (result));   // nothing new while the market is shut
+        if (meta.has_member ("currentTradingPeriod") && meta.get_object_member ("currentTradingPeriod").has_member ("regular")) {
+            var session = meta.get_object_member ("currentTradingPeriod").get_object_member ("regular");
+            q.opens = session.get_int_member_with_default ("start", 0);
+            q.closes = session.get_int_member_with_default ("end", 0);
+        }
         // Bars are exact; the meta price is rounded to a few decimals, which turns VNDUSD=X into 0.0.
         double price = q.intra.n > 0 ? q.intra.v[q.intra.n - 1] : meta.get_double_member_with_default ("regularMarketPrice", q.daily.v[q.daily.n - 1]);
         q.tick (price, meta.get_int_member_with_default ("regularMarketTime", now));
@@ -318,9 +398,17 @@ public class Feed {
     // prev_close stays NaN: the daily series' previous bar is already the day's reference price.
     async void refresh_ssi (Quote q) throws Error {
         var now = get_real_time () / 1000000;
-        q.intra = yield ssi_bars (q.symbol, "5", now - 7 * 86400);
+        var bars = yield ssi_bars (q.symbol, "5", bars_from (q, now));
+        q.intra.merge (bars);
         if (q.intra.n > 0) q.tick (q.intra.v[q.intra.n - 1], q.intra.t[q.intra.n - 1]);
         else q.price = q.daily.v[q.daily.n - 1];
+        // SSI doesn't say when the market is open. Vietnam trades 09:00 to 15:00 on weekdays; on a
+        // holiday that just means a few refreshes that come back empty.
+        int64 local = now + q.gmtoffset, midnight = now - local % 86400;
+        if (new DateTime.from_unix_utc (local).get_day_of_week () <= 5) {
+            q.opens = midnight + 9 * 3600;
+            q.closes = midnight + 15 * 3600;
+        }
     }
 }
 

@@ -78,6 +78,7 @@ void main () {
     p.quotes["J"] = j;
     p.lots.append (lot ("J", 1, 1000, 2));
     assert (string.joinv (" ", p.wanted ()) == "A J JPYUSD=X");
+    assert (p.tracks ("J") && !p.tracks ("JPYUSD=X"));
     p.rebase ();
     p.gain (Range.MAX, NOW, out gain, out capital);
     near (capital, 10 * 90 + 5 * 104);                        // J stays out of totals until its FX pair loads
@@ -175,6 +176,79 @@ void main () {
     assert (p.groups.length == 0 && ((Lot) p.lots.get_item (0)).group == "");
     tiles = p.tiles (Range.D1, NOW, 400, 300);
     for (int i = 0; i < tiles.length; i++) assert (tiles[i].kind == TileKind.STOCK);
+
+    // --- keeping history between runs: merging, spotting a rewritten past, and the cache itself ---
+    var c = quote ("C", "USD", 100, 1);
+    var tail = new Series ();
+    for (int d = 6; d < 12; d++) tail.add (T0 + d * DAY + 9 * 3600, 100 + d);        // days 6..11: four we have, two new
+    assert (c.daily.agrees (tail, 0));
+    var halved = new Series ();
+    for (int d = 6; d < 12; d++) halved.add (T0 + d * DAY + 9 * 3600, (100 + d) / 2.0);
+    assert (!c.daily.agrees (halved, 0));                                               // a split rewrote the past
+    var live = new Series ();
+    live.add (T0 + 8 * DAY + 9 * 3600, 108);
+    live.add (T0 + 9 * DAY + 15 * 3600, 999);                                           // its last bar is live: not compared
+    assert (c.daily.agrees (live, 0));
+    var later = new Series ();
+    for (int d = 20; d < 23; d++) later.add (T0 + d * DAY, 1);
+    assert (!c.daily.agrees (later, 0));                                                // nothing in common proves nothing
+
+    c.daily.unsaved = c.daily.n;                                                        // as if stored
+    c.daily.merge (tail);
+    assert (c.daily.n == 12 && c.daily.unsaved == 6);                                   // cut back to day 6, continued from there
+    near (c.daily.v[11], 111);
+    c.daily.unsaved = c.daily.n;
+    c.tick (112, T0 + 11 * DAY + 10 * 3600);
+    assert (c.daily.n == 12 && c.daily.unsaved == 11);                                  // the live bar moved: only it needs storing
+
+    var cache = new Cache (":memory:");
+    c.kind = "EQUITY";
+    c.checked = 4242;
+    c.intra.add (NOW - 9 * DAY, 1);                                                     // too old to be worth keeping
+    for (int i = 0; i < 3; i++) c.intra.add (NOW - 900 + i * 300, 110 + i);
+    c.daily.unsaved = 0;
+    cache.save (c, NOW);
+    assert (c.daily.unsaved == 12 && c.intra.unsaved == 4);
+    assert (cache.load ("nope", NOW) == null);
+    var back = cache.load ("C", NOW);
+    assert (back.name == c.name && back.currency == "USD" && back.kind == "EQUITY" && back.checked == 4242);
+    assert (back.daily.n == 12 && back.daily.unsaved == 12 && back.intra.n == 3);
+    near (back.daily.v[11], 112);
+    near (back.price, 112);
+    near (back.intra.v[2], 112);
+    // then the past is rewritten from day 6 on and a day is added: the stored copy follows
+    var rewritten = new Series ();
+    for (int d = 6; d < 13; d++) rewritten.add (T0 + d * DAY + 9 * 3600, 50 + d);
+    c.daily.merge (rewritten);
+    cache.save (c, NOW);
+    back = cache.load ("C", NOW);
+    assert (back.daily.n == 13);
+    near (back.daily.v[5], 105);
+    near (back.daily.v[6], 56);
+    near (back.daily.v[12], 62);
+
+    var names = new HashTable<string, string> (str_hash, str_equal);
+    names["GOOG"] = "Alphabet Inc. - Class C Capital Stock";
+    cache.save_names (names, NOW);
+    assert (cache.load_names (NOW + DAY)["GOOG"] == "Alphabet Inc. - Class C Capital Stock");
+    assert (cache.load_names (NOW + 8 * DAY) == null);                                  // a week on, they are due again
+
+    // --- when a quote is worth asking about again ---
+    var d = quote ("D", "USD", 100, 1);
+    d.opens = NOW - 3600;
+    d.closes = NOW + 3600;
+    d.refreshed = NOW - 120;
+    assert (d.due (NOW));                                                               // in session: every time
+    d.refreshed = NOW + 2 * 3600 - 120;
+    assert (!d.due (NOW + 2 * 3600));                                                   // shut, asked recently enough
+    d.refreshed = NOW + 2 * 3600 - 901;
+    assert (d.due (NOW + 2 * 3600));                                                    // shut, but a quarter of an hour has passed
+    d.opens = NOW - NOW % DAY;                                                          // a currency: "in session" all day, every day
+    d.closes = d.opens + DAY - 60;
+    d.refreshed = NOW - 120;
+    assert (!d.due (NOW));                                                              // ...but no bars, so it isn't really trading
+    d.intra.add (NOW - 300, 100);
+    assert (d.due (NOW));
 
     print ("ok\n");
 }

@@ -1,6 +1,6 @@
 # Stonks: GTK4/libadwaita portfolio tracker in Vala.
 #
-#   make            build/stonks, needs the gtk4, libadwaita, libsoup3 and json-glib -devel packages
+#   make            build/stonks, needs the gtk4, libadwaita, libsoup3, json-glib and sqlite -devel packages
 #   make sdk        the same, compiled inside the GNOME SDK flatpak (Silverblue hosts without those headers);
 #                   the binary still runs natively on the host
 #   make check      run the portfolio-math self-check
@@ -16,17 +16,17 @@
 APP    = io.github.igneous.Stonks
 PREFIX ?= $(HOME)/.local
 SDK    ?= org.gnome.Sdk//48
-PKGS   = --pkg gtk4 --pkg libadwaita-1 --pkg libsoup-3.0 --pkg json-glib-1.0
-SRC    = src/model.vala src/feed.vala src/chart.vala src/heatmap.vala src/window.vala
+PKGS   = --pkg gtk4 --pkg libadwaita-1 --pkg libsoup-3.0 --pkg json-glib-1.0 --pkg sqlite3
+SRC    = src/model.vala src/cache.vala src/feed.vala src/chart.vala src/heatmap.vala src/window.vala
 VALAC  = valac -X -lm -X -w -X -O2
 
 build/stonks: $(SRC)
 	@mkdir -p build
 	$(VALAC) $(PKGS) $(SRC) -o $@
 
-build/test: src/model.vala src/test.vala
+build/test: src/model.vala src/cache.vala src/test.vala
 	@mkdir -p build
-	$(VALAC) --pkg gio-2.0 $^ -o $@
+	$(VALAC) --pkg gio-2.0 --pkg sqlite3 $^ -o $@
 
 check: build/test
 	build/test
