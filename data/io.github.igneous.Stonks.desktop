@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Stonks
+Comment=Track theoretical stock investments
+Exec=stonks
+Icon=io.github.igneous.Stonks
+Categories=Office;Finance;GTK;
+Keywords=stocks;portfolio;finance;heatmap;
+StartupNotify=true
