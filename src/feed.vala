@@ -303,8 +303,9 @@ public class Feed {
     //   a Vietnamese ticker        Simplize's logo CDN, by ticker
     //   everything else            Financial Modeling Prep's logo images, by ticker: proper brand logos
     //                              for stocks, funds and coins on every exchange we use, at 100px and up
-    //   ...and if it has none      a coin: the image Yahoo's quote links to
-    //                              a company: an icon from its own website (see site_icon)
+    //   ...and if it has none      EODHD's logo images, then Finnhub's (stocks on the exchanges each covers)
+    //   ...and if they have none   a coin: the image Yahoo's quote links to
+    //                              a company: an icon from its own website (see site_icon), the last resort
     public async Bytes? logo (string symbol, string kind) throws Error {
         Bytes? image = null;
         bool unsure = false;   // a source couldn't be reached, so "none" would be a guess
@@ -312,10 +313,19 @@ public class Feed {
         } else if (from_ssi (symbol)) {
             image = yield image_at (@"https://cdn.simplize.vn/simplizevn/logo/$(Uri.escape_string (ssi_code (symbol))).jpeg");
         } else {
-            try {
-                image = yield image_at (@"https://financialmodelingprep.com/image-stock/$(Uri.escape_string (symbol, "=")).png");
-            } catch (Error e) {
-                unsure = true;
+            string?[] hosts = { @"https://financialmodelingprep.com/image-stock/$(Uri.escape_string (symbol, "=")).png", null, null };
+            if (kind != "CRYPTOCURRENCY") {
+                hosts[1] = eodhd_logo (symbol);
+                // Finnhub takes Yahoo's tickers as they are, bar the dot in a US share class (BRK.B).
+                hosts[2] = "https://static2.finnhub.io/file/publicdatany/finnhubimage/stock_logo/%s.png".printf (symbol.contains (".") ? symbol : symbol.replace ("-", "."));
+            }
+            foreach (var host in hosts) {
+                if (image != null || host == null) continue;
+                try {
+                    image = yield image_at (host);
+                } catch (Error e) {
+                    unsure = true;
+                }
             }
             if (image == null && kind == "CRYPTOCURRENCY") {
                 var quotes = yield quote_batch ({ symbol }, "logoUrl");
@@ -327,6 +337,17 @@ public class Feed {
         if (image == null && unsure) throw new IOError.FAILED ("the logo source can't be reached");
         cache.save_logo (symbol, image);
         return image;
+    }
+
+    // Where EODHD keeps a symbol's logo: under its own code for the exchange, by the bare ticker
+    // (lower-case for the US). Null for an exchange it doesn't have or we haven't mapped, and for US
+    // share classes and funds, which it lacks: no point asking.
+    static string? eodhd_logo (string symbol) {
+        string[] folders = { ".T", "TSE", ".KS", "KO", ".SS", "SHG", ".SZ", "SHE", ".HK", "HK", ".L", "LSE", ".TO", "TO", ".DE", "XETRA", ".PA", "PA", ".AS", "AS" };
+        if (!symbol.contains (".")) return symbol.contains ("-") ? null : @"https://eodhd.com/img/logos/US/$(symbol.down ()).png";
+        for (int i = 0; i < folders.length; i += 2)
+            if (symbol.has_suffix (folders[i])) return @"https://eodhd.com/img/logos/$(folders[i + 1])/$(symbol[0:symbol.length - folders[i].length]).png";
+        return null;
     }
 
     // The icon of the company's own website, for when nobody has its logo. Yahoo's profile names the
