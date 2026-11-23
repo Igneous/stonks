@@ -154,10 +154,12 @@ public class Feed {
     // at a time, so a hundred of them cost five requests a round rather than a hundred. SSI has to be
     // asked about each on its own, and so do small exchange rates (see coarse). Trouble reaching a
     // feed ends that feed's round there (one that is refusing us isn't asked nineteen more times).
-    // Returns the first thing that went wrong, or null.
-    public async string? refresh (GenericArray<Quote> quotes) {
+    // `thorough` holds every history against its feed now, however lately that was done: what the
+    // user's own Refresh asks for. Returns the first thing that went wrong, or null.
+    public async string? refresh (GenericArray<Quote> quotes, bool thorough = false) {
         var now = get_real_time () / 1000000;
         string? wrong = null;
+        for (int i = 0; thorough && i < quotes.length; i++) quotes[i].checked = 0;
         var yahoo = new GenericArray<Quote> ();
         var exact = new GenericArray<Quote> ();
         bool ssi_down = false;
@@ -267,7 +269,11 @@ public class Feed {
                         continue;
                     }
                     if (daily) {
-                        var tail = yield with_past (q.symbol, closes (result), q.daily.t[q.daily.n - 1] - 12 * 86400, q.gmtoffset);
+                        var theirs = closes (result);
+                        var tail = yield with_past (q.symbol, theirs, q.daily.t[q.daily.n - 1] - 12 * 86400, q.gmtoffset);
+                        // If CNBC supplied the past here and we hold nothing older than this stretch,
+                        // ours is only what Yahoo had (a cache from before CNBC was asked): start over.
+                        if (tail.n > theirs.n && q.daily.t[0] >= tail.t[0]) tail = new Series ();
                         yield reconcile (q, tail, now);
                     } else {
                         apply (q, result, now);
@@ -282,7 +288,7 @@ public class Feed {
 
     // Hold a fresh stretch of daily bars against ours. Normally they agree and any new days are
     // appended. If a split or a dividend adjustment has rewritten the past, they don't, and the whole
-    // history is downloaded again.
+    // history is downloaded again; likewise if the stretch is empty or shares no day with ours.
     async void reconcile (Quote q, Series tail, int64 now) throws Error {
         if (q.daily.agrees (tail, q.gmtoffset)) {
             q.daily.merge (tail);

@@ -936,15 +936,15 @@ public class Window : Adw.ApplicationWindow {
             bool due = p.tracks (symbol) ? q.due (now) : now - q.refreshed >= 900;
             if (all && (force || due)) stale.add (q);
         }
-        if (stale.length > 0) freshen.begin (stale);
+        if (stale.length > 0) freshen.begin (stale, false, force);
     }
 
     // Bring quotes we hold up to date, all in one go so that the feed can answer for many at once.
-    // A background round reports an outage once, not every two minutes.
-    async void freshen (GenericArray<Quote> quotes, bool asked = false) {
+    // A background round reports an outage once, not every two minutes. `thorough`: see Feed.refresh.
+    async void freshen (GenericArray<Quote> quotes, bool asked = false, bool thorough = false) {
         for (int i = 0; i < quotes.length; i++) loading.add (quotes[i].symbol);
         status.label = "Updating…";
-        var wrong = yield feed.refresh (quotes);
+        var wrong = yield feed.refresh (quotes, thorough);
         if (wrong != null && (asked || !failing)) fail (wrong);
         if (wrong != null && !asked) round_failed = true;
         for (int i = 0; i < quotes.length; i++) loading.remove (quotes[i].symbol);
