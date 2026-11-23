@@ -17,7 +17,13 @@ A GNOME app for following stocks and paper portfolios.
 
 ## Install
 
-As a Flatpak:
+Download `stonks.flatpak` from the [latest release](https://github.com/Igneous/stonks/releases/latest), then:
+
+```sh
+flatpak install --user stonks.flatpak
+```
+
+Or build the Flatpak yourself:
 
 ```sh
 flatpak install flathub org.gnome.Sdk//51 org.gnome.Platform//51 org.flatpak.Builder
