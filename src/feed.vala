@@ -76,8 +76,8 @@ public class Feed {
     const string CNBC_BARS = "https://ts-api.cnbc.com/harmony/app/bars";
     const int BATCH = 20;   // the most symbols Yahoo's spark endpoint takes in one request
     const string[] REACHES = { "1d", "7d", "1mo", "3mo", "1y" };   // how far back a spark request can ask
-    // Yahoo answers 429 to user agents that don't look like a browser.
-    Soup.Session session = new Soup.Session () { user_agent = "Mozilla/5.0 (X11; Linux x86_64)", timeout = 30 };
+    const string VERSION = "0.1.0";   // `make check` holds the metainfo's newest release to this
+    Soup.Session session = new Soup.Session () { timeout = 30 };   // no user_agent here: it would override agent()'s
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
     string? crumb;                      // see quote_batch()
     HashTable<string, double?> per_usd = new HashTable<string, double?> (str_hash, str_equal);   // see rate_hits()
@@ -101,6 +101,13 @@ public class Feed {
     public Feed (Cache cache) {
         this.cache = cache;
         session.add_feature (new Soup.CookieJar ());   // for the cookie quote_batch() needs
+        session.request_queued.connect ((msg) => { msg.request_headers.replace ("User-Agent", agent (msg.uri.get_host ())); });
+    }
+
+    // Who we say we are: ourselves, except to Yahoo, which answers 429 to agents that don't look like a browser.
+    static string agent (string host) {
+        bool yahoo = host == "yahoo.com" || host.has_suffix (".yahoo.com");
+        return yahoo ? "Mozilla/5.0 (X11; Linux x86_64)" : @"Stonks/$VERSION (+https://github.com/igneous/stonks)";
     }
 
     async Json.Object get_json (string url) throws Error {
