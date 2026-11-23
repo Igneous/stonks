@@ -109,13 +109,13 @@ public class Window : Adw.ApplicationWindow {
 
         // Heatmap page: the treemap, and a sidebar of folders that the header's toggle shows and hides.
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
-        treemap.filed.connect ((symbol, folder) => file (symbol, folder));
+        treemap.dropped.connect ((payload, folder, target, after) => dropped (payload, folder, target, after));
         var side = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         side.append (new Gtk.CenterBox () {
             start_widget = new Gtk.Label ("Folders") { css_classes = { "heading" } },
             end_widget = new Gtk.Button.from_icon_name ("folder-new-symbolic") { action_name = "win.new-folder", tooltip_text = "New folder", css_classes = { "flat" } }
         });
-        side.append (new Gtk.Label ("Sort stocks into sectors of your own: drag one onto a folder here, or onto a folder's block in the heatmap.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
+        side.append (new Gtk.Label ("Arrange by dragging, here or on the heatmap: a stock onto a folder to file it, onto another stock to put it beside that one. Folders can be dragged into order too.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
         side.append (folders);
         var split = new Adw.OverlaySplitView () {
             sidebar = new Gtk.ScrolledWindow () { child = side, hscrollbar_policy = Gtk.PolicyType.NEVER },
@@ -338,9 +338,23 @@ public class Window : Adw.ApplicationWindow {
 
     // ---- heatmap folders ----
 
-    // Put a stock in a folder ("" for none): from the Move menu, or a drop in the sidebar or the heatmap.
+    // Put a stock in a folder ("" for none): from the Move menu or the add dialog.
     void file (string symbol, string folder) {
         p.assign (symbol, folder);
+        save ();
+        update ();
+    }
+
+    // Something was dragged and dropped, in the sidebar or on the heatmap. A symbol goes into `folder`,
+    // and beside `target` (before it, or after) if it was dropped on one. A payload of "folder:" and a
+    // name is a folder being moved to just before `folder`.
+    void dropped (string payload, string folder, string? target, bool after) {
+        if (payload.has_prefix ("folder:")) {
+            p.move_group (payload.substring (7), folder);
+        } else {
+            if (target != null) p.move (payload, target, after);
+            p.assign (payload, folder);
+        }
         save ();
         update ();
     }
@@ -371,15 +385,21 @@ public class Window : Adw.ApplicationWindow {
         foreach (var name in names) {
             var folder = new Adw.ExpanderRow () { use_markup = false, title = name != "" ? name : "Ungrouped", expanded = true };
             folder.add_prefix (new Gtk.Image.from_icon_name ("folder-symbolic"));
-            // Drop a stock anywhere on the folder (its header or its rows) to file it here.
+            // Drop a stock on the folder to file it here (its rows take drops themselves, to place it
+            // among them); drop another folder on it to move that one to just before this.
             var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
             drop.drop.connect ((value, x, y) => {
-                var symbol = value.get_string ();
-                // Later, not from inside the drop: filing rebuilds this very list.
-                Idle.add (() => { file (symbol, name); return Source.REMOVE; });
+                var payload = value.get_string ();
+                // Later, not from inside the drop: it rebuilds this very list.
+                Idle.add (() => { dropped (payload, name, null, false); return Source.REMOVE; });
                 return true;
             });
             folder.add_controller (drop);
+            if (name != "") {
+                var grab = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
+                grab.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value ("folder:" + name));
+                folder.add_controller (grab);
+            }
             if (name != "") {
                 folder.add_suffix (new Gtk.Button.from_icon_name ("list-add-symbolic") {
                     tooltip_text = "Add a stock to this folder", valign = Gtk.Align.CENTER, css_classes = { "flat" },
@@ -408,6 +428,16 @@ public class Window : Adw.ApplicationWindow {
                 drag.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value (t.symbol));
                 drag.drag_begin.connect ((d) => { source.set_icon (new Gtk.WidgetPaintable (shown), 0, 0); });
                 row.add_controller (drag);
+                // Dropped on this row: beside this stock, above or below by which half was hit.
+                var beside = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
+                beside.drop.connect ((value, x, y) => {
+                    var payload = value.get_string ();
+                    bool after = y > shown.get_height () / 2;
+                    if (payload == t.symbol) return false;
+                    Idle.add (() => { dropped (payload, name, t.symbol, after); return Source.REMOVE; });
+                    return true;
+                });
+                row.add_controller (beside);
                 row.add_suffix (new Gtk.MenuButton () {
                     icon_name = "folder-symbolic", tooltip_text = "Move to folder", valign = Gtk.Align.CENTER,
                     css_classes = { "flat" }, menu_model = destinations, sensitive = targets.get_n_items () > 0

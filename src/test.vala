@@ -119,10 +119,10 @@ void main () {
     near (capital, 10 * 90 + 5 * 104 + 10);
     assert (!p.lot_gain ((Lot) p.lots.get_item (3), Range.MAX, NOW, out g, out k));
     tiles = p.tiles (Range.D1, NOW, 400, 300);
-    assert (tiles.length == 3 && tiles[1].symbol == "W" && tiles[1].value == 0);
-    near (tiles[1].weight, (15 * 109 + 20) / 2.0);
-    near (tiles[1].change, 59.0 / 58 - 1);
-    near (tiles[1].w * tiles[1].h, 400 * 300 * 827.5 / (15 * 109 + 20 + 827.5));
+    assert (tiles.length == 3 && tiles[2].symbol == "W" && tiles[2].value == 0);   // in list order: A, J, W
+    near (tiles[2].weight, (15 * 109 + 20) / 2.0);
+    near (tiles[2].change, 59.0 / 58 - 1);
+    near (tiles[2].w * tiles[2].h, 400 * 300 * 827.5 / (15 * 109 + 20 + 827.5));
 
     // nothing held at all: a plain watchlist gets equal tiles
     var watch = new Portfolio ();
@@ -132,7 +132,7 @@ void main () {
     watch.lots.append (new Lot () { symbol = "A" });
     watch.rebase ();
     tiles = watch.tiles (Range.D1, NOW, 400, 300);
-    assert (tiles.length == 2 && tiles[0].symbol == "A");
+    assert (tiles.length == 2 && tiles[0].symbol == "W");
     near (tiles[0].w * tiles[0].h, tiles[1].w * tiles[1].h);
     assert (watch.history (Range.D7, NOW, out opening).n == 0);
 
@@ -178,6 +178,32 @@ void main () {
     assert (p.groups.length == 0 && ((Lot) p.lots.get_item (0)).group == "");
     tiles = p.tiles (Range.D1, NOW, 400, 300);
     for (int i = 0; i < tiles.length; i++) assert (tiles[i].kind == TileKind.STOCK);
+
+    // --- arranging by hand: the order of the list is the order of the map ---
+    // p lists A (two lots), J, W and ^X, all in the body by now.
+    p.move ("W", "A", false);
+    order = "";
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    for (int i = 0; i < tiles.length; i++) order += tiles[i].symbol + " ";
+    assert (order == "W A J ^X ");
+    p.move ("A", "^X", true);                                                         // both lots of A go, and stay together
+    order = "";
+    for (uint i = 0; i < p.lots.get_n_items (); i++) order += ((Lot) p.lots.get_item (i)).symbol + " ";
+    assert (order == "W J ^X A A ");
+    near (((Lot) p.lots.get_item (3)).shares, 10);                                      // in the order they were in
+    p.move ("W", "nowhere", false);                                                     // no such neighbour: the end
+    assert (((Lot) p.lots.get_item (4)).symbol == "W");
+    foreach (var folder in new string[] { "One", "Two", "Three" }) p.groups.add (folder);
+    p.move_group ("Three", "One");
+    assert (p.groups[0] == "Three" && p.groups[1] == "One" && p.groups[2] == "Two");
+    p.move_group ("Three", "");
+    assert (p.groups[0] == "One" && p.groups[2] == "Three");
+    p.assign ("J", "Three");
+    p.assign ("W", "One");
+    tiles = p.tiles (Range.D1, NOW, 400, 300);
+    order = "";
+    for (int i = 0; i < tiles.length; i++) order += tiles[i].symbol + " ";
+    assert (order == "One W Three J Ungrouped ^X A ");                                  // folders in their order, empty ones absent
 
     // --- keeping history between runs: merging, spotting a rewritten past, and the cache itself ---
     var c = quote ("C", "USD", 100, 1);

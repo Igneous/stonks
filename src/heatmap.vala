@@ -15,47 +15,61 @@ int64 now_s () { return get_real_time () / 1000000; }
 
 public class Treemap : Gtk.DrawingArea {
     public Range range;
-    public signal void filed (string symbol, string folder);   // a stock was dropped on a folder's block
+    // Something was dropped: a symbol, or "folder:" and a folder's name. `folder` is the folder it
+    // landed in; `target`, if any, the symbol it was dropped on, to go before or `after` it.
+    public signal void dropped (string payload, string folder, string? target, bool after);
     Portfolio p;
     GenericArray<Tile> tiles = new GenericArray<Tile> ();
-    string dragged = "";   // symbol of the tile being dragged out
-    Tile? over;            // folder block a drag is hovering, outlined while it does
+    string dragged = "";   // what is being dragged out of here
+    Tile? hover_spot;      // while a drag hovers: the tile it would go beside,
+    Tile? hover_block;     // the folder block it would land in,
+    bool hover_after;      // and on which side of the tile
 
     public Treemap (Portfolio p) {
         this.p = p;
         has_tooltip = true;
         set_draw_func (paint);
 
-        // Drag a stock's tile out (onto a block here, or a folder in the sidebar)...
+        // Drag a tile out (to another spot here, or to the sidebar); a folder goes by its header band.
         var drag = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
         drag.prepare.connect ((x, y) => {
-            var t = at (x, y, TileKind.STOCK);
-            if (t == null) return null;
-            dragged = t.symbol;
-            return new Gdk.ContentProvider.for_value (t.symbol);
+            var t = at (x, y, TileKind.STOCK) ?? at (x, y, TileKind.BENCHMARK);
+            var block = at (x, y, TileKind.GROUP);
+            if (t != null) dragged = t.symbol;
+            else if (block != null && block.group != "") dragged = "folder:" + block.group;
+            else return null;
+            return new Gdk.ContentProvider.for_value (dragged);
         });
         drag.drag_begin.connect ((d) => {
-            ((Gtk.DragIcon) Gtk.DragIcon.get_for_drag (d)).child = new Gtk.Label (@"  $dragged  ") { height_request = 34, css_classes = { "heading", "card" } };
+            var name = dragged.has_prefix ("folder:") ? dragged.substring (7) : dragged;
+            ((Gtk.DragIcon) Gtk.DragIcon.get_for_drag (d)).child = new Gtk.Label (@"  $name  ") { height_request = 34, css_classes = { "heading", "card" } };
         });
         add_controller (drag);
 
-        // ...and drop one (from here or from the sidebar) on a folder's block to file it there.
-        var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
+        // Drop one (from here or from the sidebar) on a tile to put it beside that tile, or on a
+        // folder's block to file it there.
+        var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE) { preload = true };
+        unowned Gtk.DropTarget target = drop;
         drop.motion.connect ((x, y) => {
-            over = at (x, y, TileKind.GROUP);
+            unowned Value? held = target.get_value ();   // known while it hovers, thanks to preload
+            bool ok = aim (held != null ? held.get_string () : null, x, y, out hover_spot, out hover_block, out hover_after);
+            if (!ok) hover_spot = hover_block = null;
             queue_draw ();
-            return over != null ? Gdk.DragAction.MOVE : (Gdk.DragAction) 0;
+            return ok ? Gdk.DragAction.MOVE : (Gdk.DragAction) 0;
         });
-        drop.leave.connect (() => { over = null; queue_draw (); });
+        drop.leave.connect (() => { hover_spot = hover_block = null; queue_draw (); });
         drop.drop.connect ((value, x, y) => {
-            var block = at (x, y, TileKind.GROUP);
-            over = null;
+            Tile? spot, block;
+            bool after;
+            var payload = value.get_string ();
+            bool ok = aim (payload, x, y, out spot, out block, out after);
+            hover_spot = hover_block = null;
             queue_draw ();
-            if (block == null) return false;   // a flat map has no blocks: file it in the sidebar first
-            var symbol = value.get_string ();
-            var folder = block.group;
-            // Later, not from inside the drop: filing rebuilds the very widgets taking part in it.
-            Idle.add (() => { filed (symbol, folder); return Source.REMOVE; });
+            if (!ok) return false;
+            string folder = spot != null ? spot.group : block.group;
+            string? beside = spot != null ? spot.symbol : null;
+            // Later, not from inside the drop: it rebuilds the very widgets taking part in it.
+            Idle.add (() => { dropped (payload, folder, beside, after); return Source.REMOVE; });
             return true;
         });
         add_controller (drop);
@@ -72,6 +86,28 @@ public class Treemap : Gtk.DrawingArea {
             }
             return false;
         });
+    }
+
+    // Where a dragged thing would land at (x, y): `spot` is the tile it would go beside (null if it
+    // would only be filed in `block`'s folder), `after` the side. False if it can't go there: a stock
+    // belongs in the body, a top-row tile in the top row, a folder among the folders. With no payload
+    // (a drag whose content isn't known yet) anything under the pointer will do.
+    bool aim (string? payload, double x, double y, out Tile? spot, out Tile? block, out bool after) {
+        block = at (x, y, TileKind.GROUP);
+        spot = at (x, y, TileKind.STOCK) ?? at (x, y, TileKind.BENCHMARK);
+        after = false;
+        if (spot != null && spot.kind == TileKind.BENCHMARK) after = x > spot.x + spot.w / 2;
+        else if (spot != null) after = (x - spot.x) / spot.w + (y - spot.y) / spot.h > 1;   // past the tile's diagonal
+        if (payload == null) return spot != null || block != null;
+        if (payload.has_prefix ("folder:")) {
+            spot = null;
+            return block != null && block.group != payload.substring (7);
+        }
+        Tile? moving = null;
+        for (int i = 0; i < tiles.length; i++) if (tiles[i].kind != TileKind.GROUP && tiles[i].symbol == payload) moving = tiles[i];
+        if (moving == null || spot == moving) return false;
+        if (spot != null && spot.kind != moving.kind) spot = null;   // not a neighbour it can have
+        return spot != null || (block != null && moving.kind == TileKind.STOCK);
     }
 
     // A stock's tile: its symbol, its change and its name, stacked and centered. The name is what says
@@ -165,14 +201,25 @@ public class Treemap : Gtk.DrawingArea {
             foreach (var markup in fits)
                 if (draw_text (this, cr, markup, t.x + t.w / 2, t.y + t.h / 2, 0.5, 0.5, t.w - 10, t.h - 6)) break;
         }
-        // Where a dragged stock would land.
-        for (int i = 0; over != null && i < tiles.length; i++) {
+        // Where a dragged thing would land: a thick white edge on the side of the tile it would go
+        // beside (top and left for before, bottom and right for after), or an outline of the folder.
+        cr.set_source_rgb (1, 1, 1);
+        cr.set_line_width (5);
+        for (int i = 0; i < tiles.length; i++) {
             var t = tiles[i];
-            if (t.kind != TileKind.GROUP || t.group != over.group) continue;
-            cr.set_source_rgb (1, 1, 1);
-            cr.set_line_width (4);
-            cr.rectangle (t.x + 3, t.y + 3, t.w - 6, t.h - 6);
-            cr.stroke ();
+            if (hover_spot != null && t.kind != TileKind.GROUP && t.symbol == hover_spot.symbol) {
+                double x = hover_after ? t.x + t.w - 3 : t.x + 3, y = hover_after ? t.y + t.h - 3 : t.y + 3;
+                cr.move_to (x, t.y + 3);
+                cr.line_to (x, t.y + t.h - 3);
+                if (t.kind == TileKind.STOCK) {
+                    cr.move_to (t.x + 3, y);
+                    cr.line_to (t.x + t.w - 3, y);
+                }
+                cr.stroke ();
+            } else if (hover_spot == null && hover_block != null && t.kind == TileKind.GROUP && t.group == hover_block.group) {
+                cr.rectangle (t.x + 3, t.y + 3, t.w - 6, t.h - 6);
+                cr.stroke ();
+            }
         }
     }
 }

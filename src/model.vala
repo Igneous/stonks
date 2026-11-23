@@ -226,6 +226,35 @@ public class Portfolio {
         }
     }
 
+    // Move a symbol (every lot of it) to just before another, or just after. The order of the list is
+    // the order things appear in everywhere: the table, the top row, and within a folder on the heatmap.
+    public void move (string symbol, string target, bool after) {
+        if (symbol == target) return;
+        Lot[] moved = {};
+        for (int i = (int) lots.get_n_items () - 1; i >= 0; i--) {
+            var l = (Lot) lots.get_item (i);
+            if (l.symbol != symbol) continue;
+            moved += l;
+            lots.remove (i);
+        }
+        uint at = lots.get_n_items ();   // no such target: the end
+        for (uint i = 0; i < lots.get_n_items (); i++) {
+            if (((Lot) lots.get_item (i)).symbol != target) continue;
+            at = after ? i + 1 : i;
+            if (!after) break;           // before its first lot; after its last
+        }
+        for (int i = moved.length - 1; i >= 0; i--) lots.insert (at++, moved[i]);   // collected backwards
+    }
+
+    // Move a folder to just before another ("" for the end).
+    public void move_group (string name, string before) {
+        uint from = 0, to;
+        if (name == before || !groups.find_with_equal_func (name, str_equal, out from)) return;
+        groups.remove_index (from);
+        if (!groups.find_with_equal_func (before, str_equal, out to)) to = groups.length;
+        groups.insert ((int) to, name);
+    }
+
     // Rename a folder, or with "" as the new name delete it and unfile its stocks.
     public void rename_group (string old, string name) {
         uint at;
@@ -343,17 +372,13 @@ public class Portfolio {
         return s;
     }
 
-    static int by_weight (Tile a, Tile b) {
-        return a.weight < b.weight ? 1 : (a.weight > b.weight ? -1 : strcmp (a.symbol, b.symbol));
-    }
-
-    // The heatmap, laid out to fill w x h: one tile per tracked symbol.
+    // The heatmap, laid out to fill w x h: one tile per tracked symbol, in the order of the list.
     //  - Indices, funds, currency pairs and commodities that are only watched are context rather than
     //    positions: they sit side by side in a row along the top.
     //  - Everything else fills the rest, sized by value. A watched stock has no value, so it gets the
     //    average holding's size (equal sizes if nothing is held).
     //  - If any stock is filed in a folder, each folder becomes a region (a GROUP tile, listed just
-    //    before its stocks) with unfiled stocks sharing one called "Ungrouped".
+    //    before its stocks) in folder order, with unfiled stocks sharing a last one called "Ungrouped".
     public GenericArray<Tile> tiles (Range r, int64 now, double w, double h) {
         var by_symbol = new HashTable<string, Tile> (str_hash, str_equal);
         var all = new GenericArray<Tile> ();
@@ -363,7 +388,8 @@ public class Portfolio {
             if (q == null) continue;
             var t = by_symbol[l.symbol];
             if (t == null) {
-                t = new Tile () { symbol = l.symbol, name = q.name, group = l.group, currency = q.currency, price = q.price, change = q.change (r, now) };
+                t = new Tile () { symbol = l.symbol, name = q.name, currency = q.currency, price = q.price, change = q.change (r, now) };
+                if (groups.find_with_equal_func (l.group, str_equal)) t.group = l.group;   // a folder that no longer exists is no folder
                 by_symbol[l.symbol] = t;
                 all.add (t);
             }
@@ -394,27 +420,25 @@ public class Portfolio {
         }
         for (int i = 0; i < body.length; i++) body[i].weight = body[i].value > 0 ? body[i].value : (held > 0 ? total / held : 1);
         if (!grouped) {
-            body.sort (by_weight);
             layout (body, 0, body.length, 0, top, w, h - top);
             for (int i = 0; i < body.length; i++) result.add (body[i]);
             return result;
         }
 
+        string[] folders = {};
+        for (int i = 0; i < groups.length; i++) folders += groups[i];
+        folders += "";   // the unfiled, last
         var regions = new GenericArray<Tile> ();
-        var by_group = new HashTable<string, Tile> (str_hash, str_equal);
-        for (int i = 0; i < body.length; i++) {
-            var t = body[i];
-            var g = by_group[t.group];
-            if (g == null) {
-                g = new Tile () { kind = TileKind.GROUP, symbol = t.group != "" ? t.group : "Ungrouped", name = "", group = t.group };
-                by_group[t.group] = g;
-                regions.add (g);
+        foreach (var folder in folders) {
+            var g = new Tile () { kind = TileKind.GROUP, symbol = folder != "" ? folder : "Ungrouped", name = "", group = folder };
+            for (int i = 0; i < body.length; i++) {
+                if (body[i].group != folder) continue;
+                g.value += body[i].value;
+                g.weight += body[i].weight;
+                g.change += body[i].weight * body[i].change;
             }
-            g.value += t.value;
-            g.weight += t.weight;
-            g.change += t.weight * t.change;
+            if (g.weight > 0) regions.add (g);   // an empty folder has no region
         }
-        regions.sort (by_weight);
         layout (regions, 0, regions.length, 0, top, w, h - top);
         for (int i = 0; i < regions.length; i++) {
             var g = regions[i];
@@ -422,7 +446,6 @@ public class Portfolio {
             result.add (g);
             var members = new GenericArray<Tile> ();
             for (int k = 0; k < body.length; k++) if (body[k].group == g.group) members.add (body[k]);
-            members.sort (by_weight);
             double head = double.min (GROUP_HEADER, g.h / 3), edge = double.min (GROUP_BORDER, g.w / 8);
             layout (members, 0, members.length, g.x + edge, g.y + head, g.w - 2 * edge, g.h - head - edge);
             for (int k = 0; k < members.length; k++) result.add (members[k]);
@@ -430,8 +453,9 @@ public class Portfolio {
         return result;
     }
 
-    // ponytail: binary split (halve the list by weight, cut the longer side). Tiles stay reasonably
-    // square; switch to a squarified treemap if a long tail of tiny holdings turns into slivers.
+    // ponytail: binary split (halve the list by weight where it stands, cut the longer side). It keeps
+    // the list's order, which a squarified treemap would not; expect slivers if a tiny holding sits
+    // between two huge ones, and drag it elsewhere.
     static void layout (GenericArray<Tile> t, int lo, int hi, double x, double y, double w, double h) {
         if (hi - lo < 1) return;
         if (hi - lo == 1) {
