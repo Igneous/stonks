@@ -322,6 +322,8 @@ public class Window : Adw.ApplicationWindow {
         if (r != null) ranges.active = int.parse (r);
         var row = Environment.get_variable ("STONKS_ROW");
         if (row != null && int.parse (row) < p.lots.get_n_items ()) shown = ((Lot) p.lots.get_item (int.parse (row))).symbol;
+        var size = (Environment.get_variable ("STONKS_SIZE") ?? "").split ("x");
+        if (size.length == 2) set_default_size (int.parse (size[0]), int.parse (size[1]));
 
         update ();
         sync (true);

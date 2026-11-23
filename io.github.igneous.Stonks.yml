@@ -1,0 +1,24 @@
+# Builds this checkout as a Flatpak (see the Makefile). Not the Flathub manifest: that one lives in
+# Flathub's own repository and names a release tag instead of this directory.
+app-id: io.github.igneous.Stonks
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: stonks
+finish-args:
+  - --share=network        # prices
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+modules:
+  - name: stonks
+    buildsystem: simple
+    build-commands:
+      - make check install PREFIX=/app
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - build
+          - .flatpak-builder

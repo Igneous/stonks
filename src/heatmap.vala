@@ -14,6 +14,10 @@ void heat (Cairo.Context cr, double change, Range r) {
 
 int64 now_s () { return get_real_time () / 1000000; }
 
+// Bound here because GTK's own binding changed shape (a static method up to GNOME 48, a constructor since).
+[CCode (cname = "gtk_drag_icon_get_for_drag")]
+extern unowned Gtk.Widget drag_icon (Gdk.Drag drag);
+
 // Where something dragged over the heatmap would land.
 class Landing {
     public Tile? spot;     // a stock: the tile it would go beside
@@ -160,7 +164,7 @@ public class Treemap : Gtk.DrawingArea {
         drag.drag_begin.connect ((d) => {
             unhover ();
             var name = dragged.has_prefix ("folder:") ? p.folder (dragged.substring (7)).name : dragged;
-            ((Gtk.DragIcon) Gtk.DragIcon.get_for_drag (d)).child = new Gtk.Label (@"  $name  ") { height_request = 34, css_classes = { "heading", "card" } };
+            ((Gtk.DragIcon) drag_icon (d)).child =new Gtk.Label (@"  $name  ") { height_request = 34, css_classes = { "heading", "card" } };
         });
         add_controller (drag);
 

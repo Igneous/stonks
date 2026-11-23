@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.igneous.Stonks</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Stonks</name>
+  <summary>Track stocks and paper portfolios</summary>
+  <developer id="io.github.igneous">
+    <name>Bucky Wolfe</name>
+  </developer>
+  <description>
+    <p>
+      Stonks follows shares, funds, indices, currencies and crypto, and shows how a portfolio would
+      have done had you bought when you say you did. Nothing is traded and there is no account:
+      a symbol can be given a buy date and a number of shares, or simply be watched.
+    </p>
+    <ul>
+      <li>A heatmap of everything you follow, sorted into folders you lay out yourself</li>
+      <li>Charts from one day to a symbol's whole history</li>
+      <li>Gains and losses per holding and in total, in the currency you choose</li>
+      <li>US, Japanese, Korean, Chinese, Hong Kong and Vietnamese exchanges, among others</li>
+      <li>Prices are kept on disk, so it opens at once and works offline with what it has</li>
+    </ul>
+    <p>
+      Prices come from Yahoo Finance and other public sources. They can be delayed or wrong and are
+      not investment advice. Stonks is not affiliated with any of its sources.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.igneous.Stonks.desktop</launchable>
+  <url type="homepage">https://github.com/igneous/stonks</url>
+  <url type="bugtracker">https://github.com/igneous/stonks/issues</url>
+  <url type="vcs-browser">https://github.com/igneous/stonks</url>
+  <content_rating type="oars-1.1" />
+  <branding>
+    <color type="primary" scheme_preference="light">#8ff0a4</color>
+    <color type="primary" scheme_preference="dark">#26a269</color>
+  </branding>
+  <screenshots>
+    <screenshot type="default">
+      <caption>A day's moves across everything you follow</caption>
+      <image>https://raw.githubusercontent.com/igneous/stonks/v0.1.0/data/screenshots/heatmap.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>One stock, with its chart and key figures</caption>
+      <image>https://raw.githubusercontent.com/igneous/stonks/v0.1.0/data/screenshots/stock.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>How the whole portfolio has done</caption>
+      <image>https://raw.githubusercontent.com/igneous/stonks/v0.1.0/data/screenshots/performance.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.1.0" date="2026-11-23">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
