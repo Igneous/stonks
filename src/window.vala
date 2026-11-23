@@ -15,6 +15,8 @@ public class Window : Adw.ApplicationWindow {
     string path = Path.build_filename (Environment.get_user_data_dir (), "stonks", "portfolio.json");
     GenericSet<string> loading = new GenericSet<string> (str_hash, str_equal);
     string updated = "";
+    bool round_failed;   // a fetch failed since quotes last settled
+    bool failing;        // ...and so did the round before: the outage has been announced already
     Adw.Toast? error_toast;
 
     Adw.ToastOverlay toasts = new Adw.ToastOverlay ();
@@ -125,10 +127,14 @@ public class Window : Adw.ApplicationWindow {
         if (page != null) pages.visible_child_name = page;
         var r = Environment.get_variable ("STONKS_RANGE");
         if (r != null) ranges.active = int.parse (r);
+        var row = Environment.get_variable ("STONKS_ROW");
+        if (row != null) selection.selected = int.parse (row);
 
         update ();
         sync (true);
-        Timeout.add_seconds (60, () => { sync (true); return Source.CONTINUE; });
+        // ponytail: one request per symbol every two minutes. Yahoo publishes no limit for these
+        // endpoints; lengthen this if a large portfolio starts drawing HTTP 429.
+        Timeout.add_seconds (120, () => { sync (true); return Source.CONTINUE; });
     }
 
     Gtk.Label stat (Gtk.Box box, string caption) {
@@ -148,8 +154,8 @@ public class Window : Adw.ApplicationWindow {
         if (v < 0) label.add_css_class ("error");
     }
 
-    void show_gain (Gtk.Label label, double gain, double capital) {
-        label.label = capital > 0 ? "%s (%s)".printf (delta (gain), pct (gain / capital)) : "—";
+    void show_gain (Gtk.Label label, double gain, double capital, string currency) {
+        label.label = capital > 0 ? "%s (%s)".printf (delta (gain, currency), pct (gain / capital)) : "—";
         tint (label, capital > 0 ? gain : 0);
     }
 
@@ -196,21 +202,22 @@ public class Window : Adw.ApplicationWindow {
         key = double.NAN;
         var now = now_s ();
         var q = p.quotes[l.symbol];
+        var own = q != null ? q.currency : "";
         switch (col) {
         case 0: return l.symbol;
         case 1: return q != null ? q.name : "";
         case 2: key = l.shares; return "%.8g".printf (l.shares);
         case 3: return l.date;
-        case 4: key = l.price; return money (l.price);
-        case 5: if (q != null) key = q.price; return money (key);
-        case 6: return q != null ? q.currency : "";
+        case 4: key = l.price; return money (l.price, own);
+        case 5: if (q != null) key = q.price; return money (key, own);
+        case 6: return own;
         case COL_CHANGE: if (q != null) key = q.change (range, now); return pct (key);
         }
         double gain, capital;
         if (!p.lot_gain (l, Range.MAX, now, out gain, out capital)) return "—";
         switch (col) {
-        case COL_VALUE: key = capital + gain; return money (key);
-        case COL_GAIN: key = gain; return "%s (%s)".printf (delta (gain), pct (gain / capital));
+        case COL_VALUE: key = capital + gain; return money (key, p.currency);
+        case COL_GAIN: key = gain; return "%s (%s)".printf (delta (gain, p.currency), pct (gain / capital));
         default:
             double years = (now - l.ts (q.gmtoffset)) / (365.25 * 86400);
             if (years < 1) return "—";   // annualising a few months of return is noise
@@ -231,25 +238,25 @@ public class Window : Adw.ApplicationWindow {
         p.gain (Range.D1, now, out day, out day_capital);
         p.gain (Range.MAX, now, out total, out cost);
         p.gain (range, now, out moved, out moved_capital);
-        value_lbl.label = "%s %s".printf (money (cost + total), p.currency);
-        show_gain (day_lbl, day, day_capital);
-        show_gain (total_lbl, total, cost);
-        cost_lbl.label = money (cost);
+        value_lbl.label = "%s %s".printf (money (cost + total, p.currency), p.currency);
+        show_gain (day_lbl, day, day_capital, p.currency);
+        show_gain (total_lbl, total, cost, p.currency);
+        cost_lbl.label = money (cost, p.currency);
 
         var lot = selection.selected_item as Lot;
         var q = lot != null ? p.quotes[lot.symbol] : null;
         back.visible = lot != null;
         if (q != null) {
             double basis = q.basis (range, now);
-            chart_title.label = "%s · %s · %s %s".printf (q.symbol, q.name, money (q.price), q.currency);
-            show_gain (chart_change, q.price - basis, basis);
-            chart.plot (q.view (range, now), basis, q.price >= basis, range);
+            chart_title.label = "%s · %s · %s %s".printf (q.symbol, q.name, money (q.price, q.currency), q.currency);
+            show_gain (chart_change, q.price - basis, basis, q.currency);
+            chart.plot (q.view (range, now), basis, q.price >= basis, range, q.currency);
         } else {
             double opening;
             var history = p.history (range, now, out opening);
             chart_title.label = "Portfolio";
-            show_gain (chart_change, moved, moved_capital);
-            chart.plot (history, opening > 0 ? opening : double.NAN, moved >= 0, range);
+            show_gain (chart_change, moved, moved_capital, p.currency);
+            chart.plot (history, opening > 0 ? opening : double.NAN, moved >= 0, range, p.currency);
         }
 
         columns[COL_CHANGE].title = "Chg " + RANGE_LABELS[range];
@@ -274,7 +281,8 @@ public class Window : Adw.ApplicationWindow {
         }
     }
 
-    async void load_symbol (string symbol, bool full) {
+    // `asked`: the user is waiting on this symbol, so always say why it failed.
+    async void load_symbol (string symbol, bool full, bool asked = false) {
         loading.add (symbol);
         status.label = "Updating…";
         try {
@@ -286,13 +294,16 @@ public class Window : Adw.ApplicationWindow {
                 yield yahoo.refresh (q);
             }
         } catch (Error e) {
-            fail (@"$symbol: $(e.message)");
+            if (asked || !failing) fail (@"$symbol: $(e.message)");   // background refreshes report an outage once
+            if (!asked) round_failed = true;
         }
         loading.remove (symbol);
         if (loading.length == 0) {
-            updated = new DateTime.now_local ().format ("Updated %H:%M");
+            updated = new DateTime.now_local ().format (round_failed ? "Update failed %H:%M" : "Updated %H:%M");
+            failing = round_failed;
+            round_failed = false;
             var shot = Environment.get_variable ("STONKS_SHOT");
-            if (shot != null) Timeout.add (400, () => { snapshot_to (shot); return Source.REMOVE; });
+            if (shot != null) Timeout.add (1500, () => { snapshot_to (shot); return Source.REMOVE; });
         }
         update ();
     }
@@ -319,7 +330,7 @@ public class Window : Adw.ApplicationWindow {
         var symbol = new Adw.EntryRow () { title = "Symbol or company name", activates_default = true };
         var shares = new Adw.EntryRow () { title = "Shares", activates_default = true };
         var date = new Adw.EntryRow () { title = "Buy date (YYYY-MM-DD)", activates_default = true };
-        var price = new Adw.EntryRow () { title = "Price per share (empty: that day's close)", activates_default = true };
+        var price = new Adw.EntryRow () { title = "Price per share (optional)", activates_default = true };
         var hits = new Gtk.ListBox () { selection_mode = Gtk.SelectionMode.NONE, css_classes = { "boxed-list" }, visible = false };
         var top = new Adw.PreferencesGroup ();
         top.add (symbol);
@@ -332,7 +343,7 @@ public class Window : Adw.ApplicationWindow {
         form.append (hits);
         form.append (rest);
 
-        var dialog = new Adw.AlertDialog ("Add position", "Search by name, or type a Yahoo Finance ticker: AAPL, 7203.T, 005930.KS, VNM.VN, 600519.SS, 0700.HK.") {
+        var dialog = new Adw.AlertDialog ("Add position", "Search by name, or type a Yahoo Finance ticker: AAPL, 7203.T, 005930.KS, VNM.VN, 600519.SS. Leave the price empty to use that day's close.") {
             extra_child = form, default_response = "add", close_response = "cancel", prefer_wide_layout = true
         };
         dialog.add_response ("cancel", "Cancel");
@@ -401,7 +412,7 @@ public class Window : Adw.ApplicationWindow {
     }
 
     async void add_lot (Lot lot) {
-        if (!p.quotes.contains (lot.symbol)) yield load_symbol (lot.symbol, true);
+        if (!p.quotes.contains (lot.symbol)) yield load_symbol (lot.symbol, true, true);
         var q = p.quotes[lot.symbol];
         if (q == null) {
             add_dialog (lot);   // load_symbol already said why; let them fix the symbol

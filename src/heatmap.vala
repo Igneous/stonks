@@ -26,7 +26,7 @@ public class Treemap : Gtk.DrawingArea {
             for (int i = 0; i < tiles.length; i++) {
                 var t = tiles[i];
                 if (x < t.x || x >= t.x + t.w || y < t.y || y >= t.y + t.h) continue;
-                tip.set_text ("%s · %s\n%s %s · %s over %s".printf (t.symbol, t.name, money (t.value), p.currency, pct (t.change), RANGE_LABELS[range]));
+                tip.set_text ("%s · %s\n%s %s · %s over %s".printf (t.symbol, t.name, money (t.value, p.currency), p.currency, pct (t.change), RANGE_LABELS[range]));
                 tip.set_tip_area ({ (int) t.x, (int) t.y, (int) t.w, (int) t.h });
                 return true;
             }

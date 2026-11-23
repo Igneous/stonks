@@ -80,7 +80,7 @@ public class Yahoo {
     }
 
     public async Hit[] search (string text) throws Error {
-        var root = yield get_json (@"$HOST/v1/finance/search?q=$(Uri.escape_string (text))&quotesCount=6&newsCount=0");
+        var root = yield get_json (@"$HOST/v1/finance/search?q=$(Uri.escape_string (text))&quotesCount=5&newsCount=0");
         Hit[] hits = {};
         if (!root.has_member ("quotes")) return hits;
         var quotes = root.get_array_member ("quotes");

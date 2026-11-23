@@ -1,8 +1,10 @@
 // Number formatting, text drawing and the line chart.
 namespace Stonks {
 
-string money (double v) { return v.is_finite () ? "%'.2f".printf (v) : "—"; }
-string delta (double v) { return v.is_finite () ? "%+'.2f".printf (v) : "—"; }
+// Yen, won and dong amounts are shown whole: their minor units are not in use.
+int decimals (string currency) { return currency == "JPY" || currency == "KRW" || currency == "VND" ? 0 : 2; }
+string money (double v, string currency) { return v.is_finite () ? "%'.*f".printf (decimals (currency), v) : "—"; }
+string delta (double v, string currency) { return v.is_finite () ? "%+'.*f".printf (decimals (currency), v) : "—"; }
 string pct (double f) { return f.is_finite () ? "%+.2f%%".printf (f * 100) : "—"; }
 
 // Draw Pango markup in the current cairo color, its (ax, ay) fraction anchored at (x, y).
@@ -30,6 +32,7 @@ public class Chart : Gtk.DrawingArea {
     double basis = double.NAN;
     bool up = true;
     Range range;
+    string currency = "";
     int hover = -1;
     // Plot geometry, set by paint().
     double lo;
@@ -51,7 +54,8 @@ public class Chart : Gtk.DrawingArea {
     }
 
     // Show a series; `basis` (NaN for none) is drawn as the dashed reference line, `up` picks green or red.
-    public void plot (Series s, double basis, bool up, Range range) {
+    public void plot (Series s, double basis, bool up, Range range, string currency) {
+        this.currency = currency;
         this.s = s;
         this.basis = basis;
         this.up = up;
@@ -79,14 +83,14 @@ public class Chart : Gtk.DrawingArea {
         foreach (double v in s.v) { lo = double.min (lo, v); hi = double.max (hi, v); }
         if (basis.is_finite ()) { lo = double.min (lo, basis); hi = double.max (hi, basis); }
         double pad = double.max ((hi - lo) * 0.08, hi * 0.001) + 1e-9;
-        lo -= pad;
+        lo = lo >= 0 ? double.max (lo - pad, 0) : lo - pad;   // no negative axis under an all-positive series
         hi += pad;
 
         // The right margin fits the widest price label, whatever the currency's magnitude.
         int label_w = 0, label_h;
         for (int i = 0; i <= 4; i++) {
             int w;
-            create_pango_layout (money (lo + (hi - lo) * i / 4)).get_pixel_size (out w, out label_h);
+            create_pango_layout (money (lo + (hi - lo) * i / 4, currency)).get_pixel_size (out w, out label_h);
             label_w = int.max (label_w, w);
         }
         pw = width - LEFT - label_w - 16;
@@ -101,12 +105,14 @@ public class Chart : Gtk.DrawingArea {
             cr.line_to (LEFT + pw, y);
             cr.stroke ();
             cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.6);
-            draw_text (this, cr, money (v), LEFT + pw + 8, y, 0, 0.5);
+            draw_text (this, cr, money (v, currency), LEFT + pw + 8, y, 0, 0.5);
         }
+        // A 1D view of holdings on several exchanges strings their sessions together, so name the day.
+        bool span_days = range == Range.D1 && s.t[s.n - 1] - s.t[0] > 86400;
         string last = "";
         for (int i = 0; i <= 4; i++) {
             int k = (s.n - 1) * i / 4;
-            string text = new DateTime.from_unix_local (s.t[k]).format (AXIS[range]);
+            string text = new DateTime.from_unix_local (s.t[k]).format (span_days ? "%a %H:%M" : AXIS[range]);
             if (text != last) draw_text (this, cr, text, px (k), height - BOTTOM + 6, i / 4.0, 0);
             last = text;
         }
@@ -148,8 +154,8 @@ public class Chart : Gtk.DrawingArea {
         cr.arc (x, py (v), 4, 0, 2 * Math.PI);
         cr.fill ();
         var when = new DateTime.from_unix_local (s.t[hover]).format (range <= Range.D7 ? "%a %e %b, %H:%M" : "%e %b %Y");
-        var readout = "<b>%s</b>   %s".printf (money (v), when);
-        if (basis.is_finite ()) readout += "   %s (%s)".printf (delta (v - basis), pct (v / basis - 1));
+        var readout = "<b>%s</b>   %s".printf (money (v, currency), when);
+        if (basis.is_finite ()) readout += "   %s (%s)".printf (delta (v - basis, currency), pct (v / basis - 1));
         cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.9);
         draw_text (this, cr, readout, LEFT, 4, 0, 0);
     }

@@ -6,8 +6,10 @@
 #   make check      run the portfolio-math self-check
 #   make install    install binary, launcher and icon into ~/.local  (e.g. `make sdk install`)
 #
-# Dev aid: STONKS_SHOT=out.png [STONKS_VIEW=holdings|heatmap|performance] [STONKS_RANGE=0..6] build/stonks
-# renders the window to a PNG once quotes have loaded, then quits.
+# Dev aid: STONKS_SHOT=out.png [STONKS_VIEW=holdings|heatmap|performance] [STONKS_RANGE=0..6] [STONKS_ROW=n]
+# build/stonks renders the window to a PNG once quotes have loaded, then quits. To keep it off your desktop:
+#   mutter --headless --no-x11 --wayland-display shots --virtual-monitor 1400x1000 &
+#   WAYLAND_DISPLAY=shots XDG_DATA_HOME=/some/test/dir STONKS_SHOT=out.png build/stonks
 
 APP    = io.github.igneous.Stonks
 PREFIX ?= $(HOME)/.local
