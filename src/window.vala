@@ -101,12 +101,13 @@ public class Window : Adw.ApplicationWindow {
 
         // Heatmap page: the treemap, and a sidebar of folders that the header's toggle shows and hides.
         treemap = new Treemap (p) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
+        treemap.filed.connect ((symbol, folder) => file (symbol, folder));
         var side = new Gtk.Box (Gtk.Orientation.VERTICAL, 8) { margin_start = 12, margin_end = 12, margin_bottom = 12 };
         side.append (new Gtk.CenterBox () {
             start_widget = new Gtk.Label ("Folders") { css_classes = { "heading" } },
             end_widget = new Gtk.Button.from_icon_name ("folder-new-symbolic") { action_name = "win.new-folder", tooltip_text = "New folder", css_classes = { "flat" } }
         });
-        side.append (new Gtk.Label ("Sort stocks into sectors of your own. The heatmap draws each folder as one block.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
+        side.append (new Gtk.Label ("Sort stocks into sectors of your own: drag one onto a folder here, or onto a folder's block in the heatmap.") { wrap = true, xalign = 0, css_classes = { "dim-label", "caption" } });
         side.append (folders);
         var split = new Adw.OverlaySplitView () {
             sidebar = new Gtk.ScrolledWindow () { child = side, hscrollbar_policy = Gtk.PolicyType.NEVER },
@@ -160,9 +161,7 @@ public class Window : Adw.ApplicationWindow {
         move.activate.connect ((target) => {
             string symbol, folder;
             target.get ("(ss)", out symbol, out folder);
-            p.assign (symbol, folder);
-            save ();
-            update ();
+            file (symbol, folder);
         });
         add_action (move);
 
@@ -328,6 +327,13 @@ public class Window : Adw.ApplicationWindow {
 
     // ---- heatmap folders ----
 
+    // Put a stock in a folder ("" for none): from the Move menu, or a drop in the sidebar or the heatmap.
+    void file (string symbol, string folder) {
+        p.assign (symbol, folder);
+        save ();
+        update ();
+    }
+
     MenuItem menu_item (string label, string action, Variant target) {
         var item = new MenuItem (label, null);
         item.set_action_and_target_value (action, target);
@@ -354,6 +360,15 @@ public class Window : Adw.ApplicationWindow {
         foreach (var name in names) {
             var folder = new Adw.ExpanderRow () { use_markup = false, title = name != "" ? name : "Ungrouped", expanded = true };
             folder.add_prefix (new Gtk.Image.from_icon_name ("folder-symbolic"));
+            // Drop a stock anywhere on the folder (its header or its rows) to file it here.
+            var drop = new Gtk.DropTarget (typeof (string), Gdk.DragAction.MOVE);
+            drop.drop.connect ((value, x, y) => {
+                var symbol = value.get_string ();
+                // Later, not from inside the drop: filing rebuilds this very list.
+                Idle.add (() => { file (symbol, name); return Source.REMOVE; });
+                return true;
+            });
+            folder.add_controller (drop);
             if (name != "") {
                 var actions = new Menu ();
                 actions.append_item (menu_item ("Rename…", "win.rename-folder", new Variant.string (name)));
@@ -371,6 +386,13 @@ public class Window : Adw.ApplicationWindow {
                 var destinations = new Menu ();
                 destinations.append_section ("Move to", targets);
                 var row = new Adw.ActionRow () { use_markup = false, title = t.symbol, subtitle = t.name, subtitle_lines = 1 };
+                // Drag the row onto a folder here, or onto a folder's block in the heatmap.
+                var drag = new Gtk.DragSource () { actions = Gdk.DragAction.MOVE };
+                unowned Gtk.DragSource source = drag;   // unowned, or the handler below would keep
+                unowned Adw.ActionRow shown = row;      // both alive after the list is rebuilt
+                drag.prepare.connect ((x, y) => new Gdk.ContentProvider.for_value (t.symbol));
+                drag.drag_begin.connect ((d) => { source.set_icon (new Gtk.WidgetPaintable (shown), 0, 0); });
+                row.add_controller (drag);
                 row.add_suffix (new Gtk.MenuButton () {
                     icon_name = "folder-symbolic", tooltip_text = "Move to folder", valign = Gtk.Align.CENTER,
                     css_classes = { "flat" }, menu_model = destinations, sensitive = targets.get_n_items () > 0
@@ -382,7 +404,8 @@ public class Window : Adw.ApplicationWindow {
             folder.subtitle = "Empty";
             if (count == 1) folder.subtitle = "1 stock";
             if (count > 1) folder.subtitle = @"$count stocks";
-            if (name != "" || count > 0) folders.append (folder);
+            // Ungrouped stays listed while there are folders, so there is somewhere to drag a stock back out to.
+            if (name != "" || count > 0 || p.groups.length > 0) folders.append (folder);
         }
     }
 
