@@ -50,6 +50,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.1" date="2026-11-26">
+      <description>
+        <ul>
+          <li>The 30-day, year-to-date and one-year charts are drawn from hourly prices instead of daily closes</li>
+          <li>Click a point on a chart to pin it and see the stock's figures as they stood then; drag across a span to see them from its start to its end</li>
+          <li>The price of the stock you have open follows its trades live</li>
+          <li>The status line counts down to the next refresh</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-24">
       <description>
         <p>First release.</p>

@@ -15,6 +15,20 @@ public class Series {
 
     public void add (int64 ts, double val) { _t += ts; _v += val; }
 
+    // Add a point wherever it belongs in time; one already there is replaced. For the few series that
+    // don't arrive in order.
+    public void put (int64 ts, double val) {
+        int i = before (ts) + 1;
+        if (i < n && _t[i] == ts) {
+            _v[i] = val;
+            return;
+        }
+        add (ts, val);
+        for (int k = n - 1; k > i; k--) { _t[k] = _t[k - 1]; _v[k] = _v[k - 1]; }
+        _t[i] = ts;
+        _v[i] = val;
+    }
+
     // Replace the newest value: the live bar moves with every refresh.
     public void set_last (double val) {
         _v[n - 1] = val;
@@ -86,6 +100,109 @@ public class Stats {
     public int64 time;                           // of the last regular trade
 }
 
+// A stock's every day in full, and what it earned and paid out: what a point in its past is described
+// from (see Feed.past). The five series of bars share their timestamps.
+public class Past {
+    public Series open = new Series ();
+    public Series high = new Series ();
+    public Series low = new Series ();
+    public Series close = new Series ();
+    public Series volume = new Series ();
+    public Series dividends = new Series ();   // per share, on each ex-dividend day
+    public Series eps = new Series ();         // diluted earnings per share over the twelve months to each period's end
+    public Series shares = new Series ();      // shares outstanding at each period's end
+    public int64 fetched;                      // when all this was asked for
+
+    // The figures of a quote card as they stood at `t`, when the price was `price`: that day's bar,
+    // the year and the three months up to it, and the latest period reported on by then. NaN wherever
+    // we can't know: a day we have no bar for, earnings from before the records begin.
+    // ponytail: a period counts from the day it ended, not from the day its results came out, so for
+    // the few weeks in between this knows earnings the market didn't yet. Report dates would fix that.
+    public Stats at (int64 t, double price, int gmtoffset) {
+        var s = new Stats ();
+        int64 day = (t + gmtoffset) / 86400;
+        int i = close.before ((day + 1) * 86400 - gmtoffset);   // that day's bar, or the last one before it
+        if (i >= 0 && (close.t[i] + gmtoffset) / 86400 == day) {
+            s.open = open.v[i];
+            s.high = high.v[i];
+            s.low = low.v[i];
+            s.volume = volume.v[i];
+            if (i > 0) s.prev_close = close.v[i - 1];
+        }
+        double traded = 0;
+        int days = 0;
+        for (int j = i; j >= 0 && close.t[j] > t - 365 * 86400; j--) {
+            s.high52 = Math.fmax (s.high52, high.v[j]);   // fmax and fmin pass over a NaN
+            s.low52 = Math.fmin (s.low52, low.v[j]);
+            if (i - j < 63 && volume.v[j].is_finite ()) { traded += volume.v[j]; days++; }   // three months of sessions
+        }
+        if (days > 0) s.avg_volume = traded / days;
+        double paid = 0;
+        for (int j = dividends.before (t + 1); j >= 0 && dividends.t[j] > t - 365 * 86400; j--) paid += dividends.v[j];
+        if (paid > 0 && price > 0) {
+            s.dividend_rate = paid;
+            s.dividend_yield = paid / price * 100;
+        }
+        // Reported figures stand until the next period's: fifteen months at most, a fiscal year and some slack.
+        int e = eps.before (t + 1), n = shares.before (t + 1);
+        if (e >= 0 && t - eps.t[e] < 460 * 86400) {
+            s.eps = eps.v[e];
+            if (s.eps > 0) s.pe = price / s.eps;
+        }
+        if (n >= 0 && t - shares.t[n] < 460 * 86400) s.cap = price * shares.v[n];
+        return s;
+    }
+}
+
+// A price off Yahoo's stream (see Feed.follow): what we use of its protobuf message, "PricingData".
+public struct Trade {
+    public string symbol;    // field 1
+    public double price;     // 2, a 32-bit float
+    public int64 time;       // 3, sent in milliseconds
+    public int session;      // 7: 0 before the regular session, 1 during it, 2 after
+    public double change;    // 8: percent, from the previous close
+
+    public static Trade decode (uint8[] data) {
+        var trade = Trade () { symbol = "", price = double.NAN, change = double.NAN };
+        int i = 0;
+        while (i < data.length) {
+            uint64 key = varint (data, ref i);
+            int field = (int) (key >> 3), wire = (int) (key & 7);
+            if (wire == 0) {
+                uint64 n = varint (data, ref i);
+                if (field == 3) trade.time = ((int64) (n >> 1) ^ -((int64) (n & 1))) / 1000;   // zigzag-coded
+                if (field == 7) trade.session = (int) n;
+            } else if (wire == 5 && i + 4 <= data.length) {
+                uint32 bits = data[i] | data[i + 1] << 8 | data[i + 2] << 16 | (uint32) data[i + 3] << 24;
+                float number = *(float*) (&bits);
+                if (field == 2) trade.price = number;
+                if (field == 8) trade.change = number;
+                i += 4;
+            } else if (wire == 1) {
+                i += 8;
+            } else if (wire == 2) {
+                int length = (int) varint (data, ref i);
+                if (length < 0 || i + length > data.length) break;
+                if (field == 1) trade.symbol = new StringBuilder ().append_len ((string) data[i:i + length], length).str;
+                i += length;
+            } else {
+                break;   // nothing else is in this message: not one we know how to read
+            }
+        }
+        return trade;
+    }
+
+    static uint64 varint (uint8[] data, ref int i) {
+        uint64 n = 0;
+        for (int shift = 0; i < data.length && shift < 64; shift += 7) {
+            uint8 b = data[i++];
+            n |= (uint64) (b & 0x7f) << shift;
+            if (b < 0x80) break;
+        }
+        return n;
+    }
+}
+
 // One instrument as its feed quotes it. `daily` always has at least one bar.
 public class Quote {
     public string symbol = "";
@@ -97,6 +214,7 @@ public class Quote {
     public double prev_close = double.NAN;   // previous session's close when the feed states one; NaN = derive it from daily
     public Series daily = new Series ();     // full history, 1d bars; the last bar is the live session
     public Series intra = new Series ();     // last 7 days, 5m bars
+    public Series hourly = new Series ();    // last year, 1h bars, as of the twice-daily check; empty where the feed has none
     public Stats stats = new Stats ();       // empty until the feed has been asked (see Feed.load_stats)
     public int64 opens;                      // the regular session the feed last reported, unix time (0 = unknown)
     public int64 closes;
@@ -140,13 +258,24 @@ public class Quote {
 
     public double change (Range r, int64 now) { return price / basis (r, now) - 1; }
 
-    // Points to chart for a range: 5m bars up to a week, daily closes beyond (or when there are no 5m bars).
+    // Points to chart for a range: 5m bars up to a week; hourly ones from there to a year, if we hold
+    // them for the whole of it; daily closes for anything longer, and wherever the finer bars are missing.
     public Series view (Range r, int64 now) {
         int64 from = start (r, now);
-        var src = intra;
-        if (r > Range.D7 || intra.n - intra.before (from) - 1 < 2) src = daily;
+        var src = daily;
+        if (r <= Range.D7 && intra.n - intra.before (from) - 1 >= 2) src = intra;
+        // "The whole of it": they start within a long weekend of the range's first day.
+        int first = int.min (daily.before (from) + 1, daily.n - 1);
+        if (r > Range.D7 && r <= Range.Y1 && hourly.n - hourly.before (from) - 1 >= 2 && hourly.t[0] < daily.t[first] + 4 * 86400) src = hourly;
         var s = new Series ();
         for (int i = src.before (from) + 1; i < src.n; i++) s.add (src.t[i], src.v[i]);
+        if (src == hourly) {
+            // They are as of the last check: the hours since come from the 5-minute bars, and the last
+            // point, a bar still being made, is the price now.
+            for (int i = intra.before (s.t[s.n - 1] + 3600) + 1; i < intra.n; i++)
+                if (intra.t[i] >= s.t[s.n - 1] + 3600) s.add (intra.t[i], intra.v[i]);
+            s.set_last (price);
+        }
         return s;
     }
 
@@ -193,10 +322,19 @@ public class Quote {
         else daily.set_last (p);
     }
 
-    // FX rate at a moment: 5m bars where they reach, else that day's close.
+    // A trade as it happens (see Feed.follow): the price, and the 5-minute bar it falls in. The next
+    // refresh replaces these bars with the feed's own.
+    public void trade (double p, int64 t) {
+        tick (p, t);
+        if (intra.n > 0 && t - intra.t[intra.n - 1] < 300) intra.set_last (p); else intra.add (t - t % 300, p);
+    }
+
+    // FX rate at a moment: the finest bars that reach back to it, else that day's close.
     double rate (int64 t) {
         int i = intra.before (t + 1);
-        return i >= 0 ? intra.v[i] : daily.at (t);
+        if (i >= 0) return intra.v[i];
+        i = hourly.before (t + 1);
+        return i >= 0 ? hourly.v[i] : daily.at (t);
     }
 
     // This quote repriced through an FX quote: multiplied by its rate, or divided by it if `invert`.
@@ -207,6 +345,7 @@ public class Quote {
         c.price = scale (price, fx.price, invert);
         for (int i = 0; i < daily.n; i++) c.daily.add (daily.t[i], scale (daily.v[i], fx.daily.at (daily.t[i]), invert));
         for (int i = 0; i < intra.n; i++) c.intra.add (intra.t[i], scale (intra.v[i], fx.rate (intra.t[i]), invert));
+        for (int i = 0; i < hourly.n; i++) c.hourly.add (hourly.t[i], scale (hourly.v[i], fx.rate (hourly.t[i]), invert));
         c.daily.set_last (c.price);   // the live bar is worth what it converts to right now
         // Yesterday's close converts at yesterday's rate: reuse the one applied to that daily bar.
         int b = daily.before (start (Range.D1, 0));

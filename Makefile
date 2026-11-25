@@ -9,7 +9,9 @@
 # As a Flatpak: flatpak run org.flatpak.Builder --user --install --force-clean build/flatpak io.github.igneous.Stonks.yml
 #
 # Dev aid: STONKS_SHOT=out.png [STONKS_VIEW=stocks|heatmap|performance] [STONKS_RANGE=0..6] [STONKS_ROW=n] [STONKS_SIZE=1000x700]
-# build/stonks renders the window to a PNG once quotes have loaded, then quits. To keep it off your desktop:
+# [STONKS_PIN=0.3 or 0.3,0.8] [STONKS_WAIT=milliseconds] build/stonks renders the window to a PNG once quotes
+# have loaded (and STONKS_WAIT has passed: 1500 unless said), then quits. STONKS_PIN pins a point of the
+# chart, or a span, by how far across it they are. To keep it off your desktop:
 #   mutter --headless --no-x11 --wayland-display shots --virtual-monitor 1400x1000 &
 #   WAYLAND_DISPLAY=shots XDG_DATA_HOME=/some/test/dir STONKS_SHOT=out.png build/stonks
 # A STONKS_SHOT run is a separate instance, so it works while the app is open. Don't isolate test runs

@@ -67,6 +67,82 @@ void main () {
     assert (a.daily.n == 11);
     a = quote ("A", "USD", 100, 1);
 
+    // hourly bars chart the ranges between a week and a year, if they cover the range
+    for (int d = 6; d < 10; d++) for (int h = 9; h < 12; h++) a.hourly.add (T0 + d * DAY + h * 3600, 100 + d);
+    assert (a.view (Range.D30, NOW).n == 10);                 // they start on day 6: daily closes still
+    a.hourly = new Series ();
+    for (int d = 0; d < 10; d++) for (int h = 9; h < 12; h++) a.hourly.add (T0 + d * DAY + h * 3600, 100 + d);
+    assert (a.view (Range.D30, NOW).n == 30 && a.view (Range.D7, NOW).n == 7 && a.view (Range.MAX, NOW).n == 10);
+    // ...and the 5m bars fill in since the last of them, an hour apart; the end is the price now
+    a.intra.add (NOW - 600, 55);                              // within the hour of the last hourly bar: left out
+    a.intra.add (NOW, 108.7);
+    a.intra.add (NOW + 300, 108.8);
+    a.price = 108.9;
+    var fine = a.view (Range.YTD, NOW);
+    assert (fine.n == 31 && fine.t[30] == NOW);
+    near (fine.v[29], 109);
+    near (fine.v[30], 108.9);
+    a = quote ("A", "USD", 100, 1);
+
+    // a live trade moves the price, the day's bar and the 5-minute bar it falls in
+    a.trade (110, NOW);
+    a.trade (111, NOW + 60);
+    assert (a.intra.n == 1 && a.intra.t[0] == NOW - NOW % 300 && a.daily.n == 10);
+    a.trade (112, NOW + 400);
+    assert (a.intra.n == 2);
+    near (a.intra.v[0], 111);
+    near (a.daily.v[9], 112);
+    a = quote ("A", "USD", 100, 1);
+
+    // --- a point in the past: the day's bar, the year up to it, the latest period reported ---
+    var past = new Past ();
+    for (int d = 0; d < 10; d++) {
+        int64 t = T0 + d * DAY + 9 * 3600;
+        past.open.add (t, 100 + d);
+        past.high.add (t, 102 + d);
+        past.low.add (t, 99 + d);
+        past.close.add (t, 101 + d);
+        past.volume.add (t, 1000 * (d + 1));
+    }
+    past.dividends.put (T0 + 8 * DAY, 0.7);
+    past.dividends.put (T0 + 2 * DAY, 0.5);                    // out of order: put() files it where it belongs
+    past.dividends.put (T0 + 2 * DAY, 0.5);                    // ...once
+    assert (past.dividends.n == 2 && past.dividends.t[0] == T0 + 2 * DAY);
+    past.eps.put (T0 + 6 * DAY, 5);
+    past.eps.put (T0 + DAY, 4);
+    past.shares.put (T0 + DAY, 1e6);
+    var then = past.at (T0 + 7 * DAY + 10 * 3600, 108, 0);
+    near (then.open, 107);
+    near (then.high, 109);
+    near (then.low, 106);
+    near (then.volume, 8000);
+    near (then.prev_close, 107);
+    near (then.high52, 109);                                   // the highest high and lowest low of days 0..7
+    near (then.low52, 99);
+    near (then.avg_volume, 4500);
+    near (then.dividend_rate, 0.5);                            // day 8's wasn't paid yet
+    near (then.dividend_yield, 0.5 / 108 * 100);
+    near (then.eps, 5);
+    near (then.pe, 21.6);
+    near (then.cap, 108e6);
+    then = past.at (T0 + 12 * DAY, 120, 0);                    // a day with no bar: no day's figures, the year's still
+    assert (!then.open.is_finite () && !then.volume.is_finite ());
+    near (then.high52, 111);
+    near (then.dividend_rate, 1.2);
+    then = past.at (T0 + 10 * 3600, 100, 0);                   // before anything was reported
+    assert (!then.pe.is_finite () && !then.cap.is_finite () && !then.dividend_rate.is_finite ());
+    near (then.open, 100);
+    assert (!past.at (T0 - DAY, 100, 0).high52.is_finite ());  // before the records begin
+    then = past.at (T0 + 600 * DAY, 100, 0);                   // long after the last report: it no longer stands
+    assert (!then.eps.is_finite () && !then.cap.is_finite ());
+
+    // --- a price off Yahoo's stream, as it arrived ---
+    var trade = Trade.decode (Base64.decode ("CgdCVEMtVVNEFWFyakcYgNixzMJoIgNVU0QqA0NDQzApOAFFWxVfPkiAgIWrpwJVsN1rR10vzl9HZQB4AkN9p2FpR7ABgICFq6cC2AEE4AGAgIWrpwLoAYCAhaunAvIBA0JUQ4ECAAAAQHgvc0GJAgAAuqB+knFC9QIAeAJD/QJbFV8+"));
+    assert (trade.symbol == "BTC-USD" && trade.time == 1795644864 && trade.session == 1);
+    near (trade.price, 60018.37890625);
+    near (trade.change, 0.21785490214824677);
+    assert (Trade.decode ({ 0x0a, 0x7f, 0x41 }).symbol == "");   // cut short: nothing read past the end
+
     // --- portfolio in one currency ---
     var p = new Portfolio ();
     p.quotes["A"] = a;
@@ -348,9 +424,14 @@ void main () {
     cache.save (c, NOW);
     assert (c.daily.unsaved == 12 && c.intra.unsaved == 4);
     assert (cache.load ("nope", NOW) == null);
+    assert (cache.load ("C", NOW).checked == 0);                                        // no hourly bars yet: due a look
+    c.hourly.add (NOW - 400 * DAY, 1);                                                  // over a year old: not kept either
+    for (int i = 0; i < 5; i++) c.hourly.add (NOW - 5 * 3600 + i * 3600, 108 + i);
+    cache.save (c, NOW);
     var back = cache.load ("C", NOW);
     assert (back.name == c.name && back.currency == "USD" && back.kind == "EQUITY" && back.checked == 4242);
-    assert (back.daily.n == 12 && back.daily.unsaved == 12 && back.intra.n == 3);
+    assert (back.daily.n == 12 && back.daily.unsaved == 12 && back.intra.n == 3 && back.hourly.n == 5 && back.hourly.unsaved == 5);
+    near (back.hourly.v[4], 112);
     near (back.daily.v[11], 112);
     near (back.price, 112);
     near (back.intra.v[2], 112);

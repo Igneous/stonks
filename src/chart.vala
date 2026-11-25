@@ -56,29 +56,48 @@ public class Chart : Gtk.DrawingArea {
     Range range;
     int today;
     string currency = "";
-    int hover = -1;
+    double hover = -1;   // where the pointer is, across; negative while it is elsewhere
+    // What is pinned, by time so that it stays put as the series grows: a point, or the two ends of a
+    // span in the order they were dragged. Both 0 for nothing.
+    int64 anchor;
+    int64 reach;
     // Plot geometry, set by paint().
     double lo;
     double hi;
     double pw;
     double ph;
 
+    // The pins changed: a click pins a point, a drag a span, a right click (or unpin()) nothing.
+    public signal void pinned ();
+    public int64 pin_from { get { return int64.min (anchor, reach); } }
+    public int64 pin_to { get { return int64.max (anchor, reach); } }
+
     construct {
         content_height = 280;
         add_css_class ("caption");
         set_draw_func (paint);
         var motion = new Gtk.EventControllerMotion ();
-        motion.motion.connect ((x, y) => {
-            hover = pw > 0 ? (int) Math.round (((x - LEFT) / pw).clamp (0, 1) * (s.n - 1)) : -1;
-            queue_draw ();
-        });
+        motion.motion.connect ((x, y) => { hover = x; queue_draw (); });
         motion.leave.connect (() => { hover = -1; queue_draw (); });
         add_controller (motion);
+        var drag = new Gtk.GestureDrag ();
+        unowned Gtk.GestureDrag self = drag;   // unowned, or its own handler would keep it alive
+        drag.drag_begin.connect ((x, y) => mark (x, x));
+        drag.drag_update.connect ((dx, dy) => {
+            double x, y;
+            self.get_start_point (out x, out y);
+            mark (x, Math.fabs (dx) < 4 ? x : x + dx);   // a hand that shakes on a click isn't dragging
+        });
+        add_controller (drag);
+        var clear = new Gtk.GestureClick () { button = Gdk.BUTTON_SECONDARY };
+        clear.pressed.connect (() => { unpin (); pinned (); });
+        add_controller (clear);
     }
 
     // Show a series; `basis` (NaN for none) is drawn as the dashed reference line, `up` picks green or red.
     // `today`, if not 0, is the point the latest session starts at (see Quote.trail): an upright
-    // dashed line sets it off from the session before.
+    // dashed line sets it off from the session before. What is pinned stays pinned: unpin() when the
+    // chart turns to something else.
     public void plot (Series s, double basis, bool up, Range range, string currency, int today = 0) {
         this.today = today;
         this.currency = currency;
@@ -86,16 +105,55 @@ public class Chart : Gtk.DrawingArea {
         this.basis = basis;
         this.up = up;
         this.range = range;
-        hover = -1;
         queue_draw ();
+    }
+
+    public void unpin () {
+        anchor = reach = 0;
+        queue_draw ();
+    }
+
+    // Dev aid, see the Makefile: pin by position, as fractions of the chart's width.
+    public void pin (double from, double to) { mark (LEFT + pw * from, LEFT + pw * to); }
+
+    // Pin the points under two places across the chart: one point, if they are the same.
+    void mark (double from, double to) {
+        if (s.n < 2 || pw <= 0) return;
+        anchor = s.t[at (from)];
+        reach = s.t[at (to)];
+        queue_draw ();
+        pinned ();
     }
 
     // x by index, not time: nights, weekends and lunch breaks would otherwise be long flat stretches.
     double px (int i) { return LEFT + pw * i / (s.n - 1); }
     double py (double v) { return TOP + ph * (hi - v) / (hi - lo); }
+    int at (double x) { return (int) Math.round (((x - LEFT) / pw).clamp (0, 1) * (s.n - 1)); }
+    int index (int64 t) { return int.max (s.before (t + 1), 0); }
 
     void ink (Cairo.Context cr, double alpha) {
         if (up) cr.set_source_rgba (0.18, 0.76, 0.49, alpha); else cr.set_source_rgba (0.93, 0.2, 0.23, alpha);
+    }
+
+    string when (int i) {
+        return new DateTime.from_unix_local (s.t[i]).format (range <= Range.D7 ? "%a %e %b, %H:%M" : "%e %b %Y").strip ();
+    }
+
+    // A point in words (markup): its price, its time, and how far that is from the basis.
+    string point_text (int i) {
+        var text = "<b>%s</b>   %s".printf (money (s.v[i], currency), when (i));
+        if (basis.is_finite ()) text += "   %s (%s)".printf (delta (s.v[i] - basis, currency), pct (s.v[i] / basis - 1));
+        return text;
+    }
+
+    // What is pinned, in words (markup): a point as point_text() has it, or a span's two prices and
+    // times with the change from the one to the other. "" for nothing.
+    public string pin_text () {
+        if (anchor == 0 || s.n < 2) return "";
+        int a = index (pin_from), b = index (pin_to);
+        if (a == b) return point_text (a);
+        return "<b>%s → %s</b>   %s → %s   %s (%s)".printf (money (s.v[a], currency), money (s.v[b], currency), when (a), when (b),
+                                                            delta (s.v[b] - s.v[a], currency), pct (s.v[b] / s.v[a] - 1));
     }
 
     void paint (Gtk.DrawingArea area, Cairo.Context cr, int width, int height) {
@@ -178,21 +236,40 @@ public class Chart : Gtk.DrawingArea {
         cr.set_line_join (Cairo.LineJoin.ROUND);
         cr.stroke ();
 
-        if (hover < 0 || hover >= s.n) return;
-        double x = px (hover), v = s.v[hover];
+        // What is pinned: a dot on the line and a dashed level across from each point, and a wash over a span.
         cr.set_line_width (1);
+        if (anchor != 0) {
+            int a = index (pin_from), b = index (pin_to);
+            cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.07);
+            cr.rectangle (px (a), TOP, px (b) - px (a), ph);
+            cr.fill ();
+            foreach (int i in new int[] { a, b }) {   // the same point twice, if it is only the one
+                double y = Math.round (py (s.v[i])) + 0.5;
+                ink (cr, 0.9);
+                cr.set_dash ({ 6, 3 }, 0);
+                cr.move_to (LEFT, y);
+                cr.line_to (LEFT + pw, y);
+                cr.stroke ();
+                cr.set_dash (null, 0);
+                cr.arc (px (i), py (s.v[i]), 5, 0, 2 * Math.PI);
+                cr.fill_preserve ();
+                cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.9);
+                cr.stroke ();
+            }
+        }
+
+        if (hover < 0) return;
+        int h = at (hover);
+        double x = px (h);
         cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.35);
         cr.move_to (Math.round (x) + 0.5, TOP);
         cr.line_to (Math.round (x) + 0.5, TOP + ph);
         cr.stroke ();
         ink (cr, 1);
-        cr.arc (x, py (v), 4, 0, 2 * Math.PI);
+        cr.arc (x, py (s.v[h]), 4, 0, 2 * Math.PI);
         cr.fill ();
-        var when = new DateTime.from_unix_local (s.t[hover]).format (range <= Range.D7 ? "%a %e %b, %H:%M" : "%e %b %Y");
-        var readout = "<b>%s</b>   %s".printf (money (v, currency), when);
-        if (basis.is_finite ()) readout += "   %s (%s)".printf (delta (v - basis, currency), pct (v / basis - 1));
         cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.9);
-        draw_text (this, cr, readout, LEFT, 4, 0, 0);
+        draw_text (this, cr, point_text (h), LEFT, 4, 0, 0);
     }
 }
 

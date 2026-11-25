@@ -8,6 +8,11 @@
 //                   Drop-in alternatives that returned identical bars when this was written:
 //                   services.entrade.com.vn/chart-api/v2/ohlcs/stock and dchart-api.vndirect.com.vn/dchart/history.
 //   CNBC            only the past of an index Yahoo has no history for (see with_past).
+//   Entrade         only Vietnam's hourly bars (see hours): SSI keeps a month of them, this broker's
+//                   chart service a year and more.
+//
+// Yahoo is also where a stock's earnings history comes from (see past), and it has the one feed that
+// isn't asked but listened to: the socket its own pages keep open for live prices (see follow).
 //
 // Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities, and
 // logos come from wherever logo() says.
@@ -15,7 +20,8 @@
 // Being a polite guest of them all: everything fetched goes into the on-disk Cache, so a symbol's
 // whole history is downloaded once and after that only the bars since the last ones we have; a quote
 // is refreshed only when Quote.due() says its market could have moved, twenty symbols to a request
-// where the feed allows (see refresh); and the name directory is fetched once a week.
+// where the feed allows (see refresh); and the name directory is fetched once a week. What only a
+// pinned point of a chart needs (see past) is asked for when one is first pinned, not before.
 namespace Stonks {
 
 // A search result.
@@ -29,7 +35,7 @@ public class Hit {
     public double rate = double.NAN;    // times this is the totals currency; NaN if it already is, or unknown
 }
 
-public class Feed {
+public class Feed : Object {
     // Markets a search can be kept to (the add dialog's dropdown): a label, then how the market's
     // symbols are told apart. That is a Yahoo suffix (".T"); "US" for unsuffixed stocks and funds; or
     // "=" and an instrument type as Yahoo's lookup names it. The first is no constraint at all.
@@ -74,9 +80,11 @@ public class Feed {
     const string SSI_BARS = "https://iboard-api.ssi.com.vn/statistics/charts/history";
     const string SSI_INFO = "https://iboard-query.ssi.com.vn/stock";
     const string CNBC_BARS = "https://ts-api.cnbc.com/harmony/app/bars";
+    const string ENTRADE_BARS = "https://services.entrade.com.vn/chart-api/v2/ohlcs";
+    const string STREAM = "wss://streamer.finance.yahoo.com/?version=2";
     const int BATCH = 20;   // the most symbols Yahoo's spark endpoint takes in one request
     const string[] REACHES = { "1d", "7d", "1mo", "3mo", "1y" };   // how far back a spark request can ask
-    const string VERSION = "0.1.0";   // `make check` holds the metainfo's newest release to this
+    const string VERSION = "1.1";   // `make check` holds the metainfo's newest release to this
     Soup.Session session = new Soup.Session () { timeout = 30 };   // no user_agent here: it would override agent()'s
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
     string? crumb;                      // see quote_batch()
@@ -84,6 +92,16 @@ public class Feed {
     HashTable<string, Found> found = new HashTable<string, Found> (str_hash, str_equal);          // see search()
     Cache cache;
     GenericArray<Listed>? vietnam;   // see load_vietnam()
+    HashTable<string, Past> pasts = new HashTable<string, Past> (str_hash, str_equal);           // see past()
+    // The live price stream, see follow().
+    Soup.WebsocketConnection? socket;
+    Quote? followed;
+    bool connecting;
+    uint tuned;                           // counts connections, so that the handlers of an old one stand down
+    int64 heard_at;                       // when its last price came, on the monotonic clock
+    public bool live;                     // connected, and subscribed to the quote followed
+    public double pace = double.NAN;      // seconds between the prices it has been sending, smoothed
+    public signal void heard ();          // a price came in, or the connection came or went
 
     // A company on a list we search ourselves.
     class Listed {
@@ -144,8 +162,8 @@ public class Feed {
         return cache.load (symbol, get_real_time () / 1000000);
     }
 
-    // A symbol from scratch: its whole daily history and the last week of 5-minute bars. The one big
-    // download per symbol; afterwards it lives in the cache.
+    // A symbol from scratch: its whole daily history, a year of hourly bars and the last week of
+    // 5-minute ones. The one big download per symbol; afterwards it lives in the cache.
     public async Quote download (string symbol) throws Error {
         var now = get_real_time () / 1000000;
         Quote q;
@@ -156,7 +174,7 @@ public class Feed {
     }
 
     // Bring quotes up to date: the price, and the 5-minute bars since the last ones each has. Twice a
-    // day at most a quote's daily history is also held against the feed's.
+    // day at most a quote's daily history is also held against the feed's, and its hourly bars topped up.
     // In as few requests as the feeds allow, and one after another: Yahoo answers for twenty symbols
     // at a time, so a hundred of them cost five requests a round rather than a hundred. SSI has to be
     // asked about each on its own, and so do small exchange rates (see coarse). Trouble reaching a
@@ -176,6 +194,7 @@ public class Feed {
             if (!from_ssi (q.symbol) || ssi_down) continue;
             try {
                 if (now - q.checked > 12 * 3600) {
+                    q.hourly.merge (yield hours (q.symbol, hours_from (q, now)));
                     var tail = yield ssi_bars (q.symbol, "1D", q.daily.t[q.daily.n - 1] - 12 * 86400);
                     yield reconcile (q, tail, now);
                 }
@@ -188,14 +207,16 @@ public class Feed {
             }
         }
         try {
-            // Histories first: the prices that follow go into each one's last bar.
-            for (int daily = 1; daily >= 0; daily--) {
-                var missing = yield spark (yahoo, daily == 1, now);
+            // Histories first: the prices that follow go into each one's last bar. And hourly bars
+            // before daily ones: checking those is what marks a quote as checked.
+            foreach (unowned string interval in new string[] { "1h", "1d", "5m" }) {
+                var missing = yield spark (yahoo, interval, now);
                 if (missing != null) wrong = wrong ?? @"$missing: Yahoo has no data for it";
             }
             for (int i = 0; i < exact.length; i++) {
                 var q = exact[i];
                 if (now - q.checked > 12 * 3600) {
+                    q.hourly.merge (yield hours (q.symbol, hours_from (q, now)));
                     int64 from = q.daily.t[q.daily.n - 1] - 12 * 86400;
                     var tail = yield chart (q.symbol, @"period1=$from&period2=$now&interval=1d");
                     yield reconcile (q, closes (tail), now);
@@ -218,17 +239,17 @@ public class Feed {
     static bool coarse (Quote q) { return q.kind == "CURRENCY" && q.price < 100; }
 
     // One pass over Yahoo's quotes through its "spark" endpoint, which is chart() for up to twenty
-    // symbols in a request and wants no key either. `daily` says which pass: the twice-daily check of
-    // each history, or prices and 5-minute bars. Quotes that need the same reach back share requests,
-    // so that nobody's is bigger than it has to be. Returns a symbol Yahoo no longer answers for, if
-    // there is one; throws if Yahoo can't be had.
-    async string? spark (GenericArray<Quote> quotes, bool daily, int64 now) throws Error {
+    // symbols in a request and wants no key either. `interval` says which pass: "1h" or "1d", the
+    // twice-daily top-up of hourly bars and check of each history, or "5m", prices and 5-minute bars.
+    // Quotes that need the same reach back share requests, so that nobody's is bigger than it has to
+    // be. Returns a symbol Yahoo no longer answers for, if there is one; throws if Yahoo can't be had.
+    async string? spark (GenericArray<Quote> quotes, string interval, int64 now) throws Error {
         string? missing = null;
         string[] reach = {};
         for (int i = 0; i < quotes.length; i++) {
             var q = quotes[i];
             string r = "";
-            if (!daily) {
+            if (interval == "5m") {
                 // The latest session is all we lack if it is the one we last saw, or if we saw that one
                 // out and at most one more can have begun. Otherwise (a first refresh since launch
                 // included: none of this is kept on disk) the week of 5-minute bars is asked for whole.
@@ -236,14 +257,14 @@ public class Feed {
                 bool next = q.refreshed >= q.closes && now - q.refreshed < 20 * 3600;
                 r = same || next ? "1d" : "7d";
             } else if (now - q.checked > 12 * 3600) {
-                int64 gap = now - q.daily.t[q.daily.n - 1];
+                var have = interval == "1h" ? q.hourly : q.daily;
+                int64 gap = have.n > 0 ? now - have.t[have.n - 1] : int64.MAX;
                 r = "1y";   // away longer than that and nothing overlaps: reconcile() starts over
                 if (gap < 80 * 86400) r = "3mo";
                 if (gap < 20 * 86400) r = "1mo";
             }
             reach += r;
         }
-        var interval = daily ? "1d" : "5m";
         foreach (unowned string r in REACHES) {
             var group = new GenericArray<Quote> ();
             for (int i = 0; i < quotes.length; i++) if (reach[i] == r) group.add (quotes[i]);
@@ -272,10 +293,13 @@ public class Feed {
                     var q = group[i];
                     var result = answers[q.symbol];
                     if (result == null) {
-                        missing = missing ?? q.symbol;   // delisted, or renamed: Yahoo just leaves it out
+                        // Delisted, or renamed: Yahoo just leaves it out. (Having no hourly bars is no news.)
+                        if (interval != "1h") missing = missing ?? q.symbol;
                         continue;
                     }
-                    if (daily) {
+                    if (interval == "1h") {
+                        q.hourly.merge (closes (result));
+                    } else if (interval == "1d") {
                         var theirs = closes (result);
                         var tail = yield with_past (q.symbol, theirs, q.daily.t[q.daily.n - 1] - 12 * 86400, q.gmtoffset);
                         // If CNBC supplied the past here and we hold nothing older than this stretch,
@@ -304,6 +328,7 @@ public class Feed {
             if (from_ssi (q.symbol)) again = yield fetch_ssi (q.symbol); else again = yield fetch_yahoo (q.symbol);
             q.daily = again.daily;
             q.intra = again.intra;
+            q.hourly = again.hourly;
             q.name = again.name;
             q.currency = again.currency;
             q.kind = again.kind;
@@ -316,6 +341,28 @@ public class Feed {
     static int64 bars_from (Quote q, int64 now) {
         int64 week = now - 7 * 86400;
         return q.intra.n > 0 && q.intra.t[q.intra.n - 1] > week ? q.intra.t[q.intra.n - 1] - 1800 : week;
+    }
+
+    // From when to ask for hourly bars: a day before the last one we have, or a year back.
+    static int64 hours_from (Quote q, int64 now) {
+        int64 year = now - 365 * 86400;
+        return q.hourly.n > 0 ? int64.max (q.hourly.t[q.hourly.n - 1] - 86400, year) : year;
+    }
+
+    // Hourly closes since `from`, for the charts between a week and a year long. Nobody's refresh
+    // fails for want of them: empty if they can't be had, and daily closes are charted instead.
+    // Vietnam's are Entrade's, whose hours close where SSI's days do (both adjust for dividends).
+    async Series hours (string symbol, int64 from) {
+        var now = get_real_time () / 1000000;
+        try {
+            if (!from_ssi (symbol)) return closes (yield chart (symbol, @"period1=$from&period2=$now&interval=1h"));
+            var code = ssi_code (symbol);
+            if (code == "HNXINDEX") code = "HNX";   // the one name the two don't share
+            var root = yield get_json (@"$ENTRADE_BARS/$(symbol.has_prefix ("^") ? "index" : "stock")?from=$from&to=$now&symbol=$(Uri.escape_string (code))&resolution=1H");
+            if (root.has_member ("t") && !root.get_null_member ("t") && root.has_member ("c") && !root.get_null_member ("c"))
+                return series (root.get_array_member ("t"), root.get_array_member ("c"), symbol.has_prefix ("^") ? 1 : 1000);
+        } catch (Error e) {}
+        return new Series ();
     }
 
     // A US security's full name ("Alphabet Inc. - Class C Capital Stock") if we know it, else null.
@@ -627,6 +674,182 @@ public class Feed {
         }
     }
 
+    // ---- A point in the past ----
+
+    // A symbol's every day in full and its earnings history, for describing a point of its past (see
+    // Past.at). Two requests, made the first time one of its points is pinned; the answer is kept for
+    // the session, until the quote has a day it doesn't (and a quarter of an hour at the least, however
+    // the two feeds' days compare). Null if it can't be had right now.
+    public async Past? past (Quote q) {
+        var now = get_real_time () / 1000000;
+        var kept = pasts[q.symbol];
+        bool whole = kept != null && (kept.close.t[kept.close.n - 1] + q.gmtoffset) / 86400 >= (q.daily.t[q.daily.n - 1] + q.gmtoffset) / 86400;
+        if (kept != null && (whole || now - kept.fetched < 900)) return kept;
+        var past = new Past () { fetched = now };
+        int64 split = 0;   // when its shares were last split
+        try {
+            Json.Object bars;
+            Json.Array times;
+            double scale = 1;
+            if (from_ssi (q.symbol)) {
+                var root = yield get_json (@"$SSI_BARS?resolution=1D&symbol=$(Uri.escape_string (ssi_code (q.symbol)))&from=0&to=$now");
+                if (!root.has_member ("data") || root.get_null_member ("data") || !root.get_object_member ("data").has_member ("t")) return null;
+                bars = root.get_object_member ("data");
+                times = bars.get_array_member ("t");
+                if (!q.symbol.has_prefix ("^")) scale = 1000;
+            } else {
+                // Split-adjusted like our closes, and (also like them) not adjusted for dividends.
+                var result = yield chart (q.symbol, @"period1=$(now - 36000 * (int64) 86400)&period2=$now&interval=1d&events=div,splits");
+                if (!result.has_member ("timestamp")) return null;   // nothing ever traded
+                bars = result.get_object_member ("indicators").get_array_member ("quote").get_object_element (0);
+                times = result.get_array_member ("timestamp");
+                var events = result.has_member ("events") ? result.get_object_member ("events") : new Json.Object ();
+                if (events.has_member ("dividends")) events.get_object_member ("dividends").foreach_member ((o, name, node) => {
+                    past.dividends.put (node.get_object ().get_int_member_with_default ("date", 0), node.get_object ().get_double_member_with_default ("amount", 0));
+                });
+                if (events.has_member ("splits")) events.get_object_member ("splits").foreach_member ((o, name, node) => {
+                    split = int64.max (split, node.get_object ().get_int_member_with_default ("date", 0));
+                });
+            }
+            // Both feeds call the columns by their initials or their names; neither has every cell.
+            Json.Array[] columns = {};
+            foreach (unowned string name in new string[] { "open", "high", "low", "close", "volume" }) {
+                var key = bars.has_member (name) ? name : name.substring (0, 1);
+                if (!bars.has_member (key) || bars.get_null_member (key)) return null;
+                columns += bars.get_array_member (key);
+            }
+            Series[] into = { past.open, past.high, past.low, past.close, past.volume };
+            for (uint i = 0; i < times.get_length (); i++) {
+                if (i >= columns[3].get_length () || columns[3].get_null_element (i)) continue;   // a day without a close: no bar
+                for (int k = 0; k < 5; k++) {
+                    bool there = i < columns[k].get_length () && !columns[k].get_null_element (i);
+                    into[k].add (times.get_int_element (i), there ? columns[k].get_double_element (i) * (k < 4 ? scale : 1) : double.NAN);
+                }
+            }
+        } catch (Error e) {
+            return null;
+        }
+        if (past.close.n == 0) return null;
+        try {
+            // What it reported, as far back as Yahoo gives it out: four fiscal years, the last few
+            // quarters in more detail. Figures in another currency than it trades in (an ADR's) are
+            // left out, as are trailing earnings from before a split: only some of those are restated
+            // for it, and nothing says which. The yearly figures all are.
+            var root = yield get_json (@"$YAHOO/ws/fundamentals-timeseries/v1/finance/timeseries/$(Uri.escape_string (q.symbol, "="))?type=trailingDilutedEPS,annualDilutedEPS,quarterlyOrdinarySharesNumber,annualOrdinarySharesNumber&period1=0&period2=$now");
+            var results = root.get_object_member ("timeseries").get_array_member ("result");
+            reported (results, "trailingDilutedEPS", q.currency, split, past.eps);
+            reported (results, "annualDilutedEPS", q.currency, 0, past.eps);
+            reported (results, "quarterlyOrdinarySharesNumber", q.currency, 0, past.shares);
+            reported (results, "annualOrdinarySharesNumber", q.currency, 0, past.shares);
+        } catch (Error e) {}   // an index, a fund, a coin: nothing to report
+        pasts[q.symbol] = past;
+        return past;
+    }
+
+    // One kind of figure out of Yahoo's fundamentals, a point per period end, for those ending after `after`.
+    static void reported (Json.Array results, string type, string currency, int64 after, Series into) {
+        for (uint i = 0; i < results.get_length (); i++) {
+            var o = results.get_object_element (i);
+            if (!o.has_member (type) || o.get_null_member (type)) continue;
+            var rows = o.get_array_member (type);
+            for (uint k = 0; k < rows.get_length (); k++) {
+                if (rows.get_null_element (k)) continue;
+                var row = rows.get_object_element (k);
+                var day = new DateTime.from_iso8601 (row.get_string_member_with_default ("asOfDate", "") + "T00:00:00Z", null);
+                if (day == null || day.to_unix () <= after || !row.has_member ("reportedValue")) continue;
+                if (row.get_string_member_with_default ("currencyCode", currency) != currency) continue;
+                into.put (day.to_unix (), row.get_object_member ("reportedValue").get_double_member_with_default ("raw", double.NAN));
+            }
+        }
+    }
+
+    // ---- Live prices ----
+
+    // Have one quote's price follow its trades as they happen, or none (null). Yahoo's pages keep a
+    // socket open for this: subscribed to a symbol, it sends that symbol's price whenever it changes,
+    // every few seconds while it trades. `heard` fires as prices come in and as the connection comes
+    // and goes; `live` and `pace` say how it stands. Safe to call again and again: it only acts on a
+    // change, or to try again after the connection was lost.
+    // Not Vietnam's symbols, which Yahoo doesn't price for us, and not the pairs it rounds (see coarse).
+    public void follow (Quote? q) {
+        if (q != null && (from_ssi (q.symbol) || coarse (q))) q = null;
+        if (q == followed && (q == null || socket != null)) return;
+        if (q != followed) {
+            followed = q;
+            live = false;
+            pace = double.NAN;
+            heard_at = 0;
+            if (socket != null) {
+                var old = socket;
+                socket = null;
+                tuned++;
+                old.close (Soup.WebsocketCloseCode.NORMAL, null);
+            }
+            heard ();
+        }
+        if (q != null) listen.begin ();
+    }
+
+    async void listen () {
+        if (connecting) return;
+        connecting = true;
+        while (followed != null && socket == null) {
+            var q = followed;
+            try {
+                var ws = yield session.websocket_connect_async (new Soup.Message ("GET", STREAM), null, null, Priority.DEFAULT, null);
+                if (followed != q) {   // the user moved on while it connected
+                    ws.close (Soup.WebsocketCloseCode.NORMAL, null);
+                    continue;
+                }
+                socket = ws;
+                uint mine = ++tuned;
+                // Quiet markets send nothing for hours: pings keep the connection up meanwhile.
+                // ponytail: one that dies without a word (a suspended laptop) is only noticed when TCP
+                // gives up on it; libsoup 3.6's keepalive_pong_timeout would notice within seconds.
+                ws.keepalive_interval = 20;
+                ws.message.connect ((type, body) => { if (mine == tuned) hear (q, body); });
+                ws.closed.connect (() => {
+                    if (mine != tuned) return;
+                    socket = null;   // lost: the next follow() connects again
+                    live = false;
+                    heard ();
+                });
+                ws.send_text ("{\"subscribe\":[\"%s\"]}".printf (q.symbol));
+                live = true;
+            } catch (Error e) {
+                break;   // can't be had right now: the next follow() tries again
+            }
+        }
+        connecting = false;
+        heard ();
+    }
+
+    // A message off the stream: {"type": "pricing", "message": a PricingData, in base64}.
+    void hear (Quote q, Bytes body) {
+        try {
+            var node = Json.from_string ((string) body.get_data ());   // libsoup ends a message with a NUL
+            if (node == null || node.get_node_type () != Json.NodeType.OBJECT) return;
+            var trade = Trade.decode (Base64.decode (node.get_object ().get_string_member_with_default ("message", "")));
+            if (trade.symbol != q.symbol || !(trade.price > 0)) return;
+            if (trade.session == 1) {
+                q.trade (trade.price, trade.time);
+            } else if (q.stats.extra != "") {
+                // Before or after hours: the price stays the regular session's, and this is the card's other line.
+                q.stats.extra_price = trade.price;
+                q.stats.extra_change = trade.change;
+            }
+            int64 at = get_monotonic_time ();
+            if (heard_at > 0) pace = pace.is_finite () ? pace * 0.7 + (at - heard_at) / 1e6 * 0.3 : (at - heard_at) / 1e6;
+            heard_at = at;
+            heard ();
+        } catch (Error e) {}
+    }
+
+    // Seconds since the stream last sent a price; NaN if it hasn't yet.
+    public double quiet () {
+        return heard_at > 0 ? (get_monotonic_time () - heard_at) / 1e6 : double.NAN;
+    }
+
     // ---- Logos ----
     // Looked up once per symbol and then kept for good, "there is none" included: nothing here is
     // asked for a second time unless the user says to (forget_logos).
@@ -836,6 +1059,7 @@ public class Feed {
         q.name = meta.get_string_member_with_default ("longName", meta.get_string_member_with_default ("shortName", symbol));
         q.daily = yield with_past (symbol, q.daily, from, q.gmtoffset);
         if (q.daily.n == 0) throw new IOError.FAILED ("no price history");
+        q.hourly = yield hours (symbol, now - 365 * 86400);
         apply (q, yield chart (symbol, @"period1=$(bars_from (q, now))&period2=$now&interval=5m"), now);
         return q;
     }
@@ -924,6 +1148,7 @@ public class Feed {
             q.name = info.get_string_member_with_default ("companyNameEn", code);
             q.kind = info.get_string_member_with_default ("stockType", "s") == "e" ? "ETF" : "EQUITY";
         }
+        q.hourly = yield hours (symbol, get_real_time () / 1000000 - 365 * 86400);
         yield refresh_ssi (q);
         return q;
     }

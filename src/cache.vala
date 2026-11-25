@@ -33,7 +33,8 @@ public class Cache {
         return db.prepare_v2 (sql, -1, out statement) == Sqlite.OK ? (owned) statement : null;
     }
 
-    // A quote as last stored, or null. 5-minute bars more than a week old are left behind.
+    // A quote as last stored, or null. 5-minute bars more than a week old are left behind, and hourly
+    // ones more than a year old. `intraday` is 0 for daily bars, 1 for 5-minute ones and 2 for hourly.
     public Quote? load (string symbol, int64 now) {
         if (db == null) return null;
         var row = query ("SELECT name, currency, kind, gmtoffset, checked FROM quotes WHERE symbol = ?");
@@ -43,16 +44,19 @@ public class Cache {
             symbol = symbol, name = row.column_text (0) ?? symbol, currency = row.column_text (1) ?? "", kind = row.column_text (2) ?? "",
             gmtoffset = row.column_int (3), checked = row.column_int64 (4)
         };
-        var bars = query ("SELECT intraday, t, close FROM bars WHERE symbol = ? AND (intraday = 0 OR t >= ?) ORDER BY intraday, t");
+        var bars = query ("SELECT intraday, t, close FROM bars WHERE symbol = ? AND (intraday = 0 OR (intraday = 1 AND t >= ?) OR (intraday = 2 AND t >= ?)) ORDER BY intraday, t");
         bars.bind_text (1, symbol);
         bars.bind_int64 (2, now - 7 * 86400);
-        while (bars.step () == Sqlite.ROW) {
-            if (bars.column_int (0) == 0) q.daily.add (bars.column_int64 (1), bars.column_double (2));
-            else q.intra.add (bars.column_int64 (1), bars.column_double (2));
-        }
+        bars.bind_int64 (3, now - 370 * 86400);
+        Series[] kinds = { q.daily, q.intra, q.hourly };
+        while (bars.step () == Sqlite.ROW) kinds[bars.column_int (0).clamp (0, 2)].add (bars.column_int64 (1), bars.column_double (2));
         if (q.daily.n == 0) return null;   // Quote promises at least one daily bar
         q.daily.unsaved = q.daily.n;
         q.intra.unsaved = q.intra.n;
+        q.hourly.unsaved = q.hourly.n;
+        // No hourly bars: a cache from before they were kept, or a symbol whose feed had none. Have its
+        // history looked at on this launch's first refresh, which asks for them (see Feed.refresh).
+        if (q.hourly.n == 0) q.checked = 0;
         q.price = q.daily.v[q.daily.n - 1];   // the live bar, as of the last refresh
         return q;
     }
@@ -71,9 +75,11 @@ public class Cache {
         row.step ();
         save_bars (q.symbol, 0, q.daily);
         save_bars (q.symbol, 1, q.intra);
-        var stale = query ("DELETE FROM bars WHERE symbol = ? AND intraday = 1 AND t < ?");
+        save_bars (q.symbol, 2, q.hourly);
+        var stale = query ("DELETE FROM bars WHERE symbol = ? AND ((intraday = 1 AND t < ?) OR (intraday = 2 AND t < ?))");
         stale.bind_text (1, q.symbol);
         stale.bind_int64 (2, now - 8 * 86400);
+        stale.bind_int64 (3, now - 372 * 86400);
         stale.step ();
         db.exec ("COMMIT");
     }

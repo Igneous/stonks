@@ -13,6 +13,8 @@ const string[] FACTS = { "Open", "High", "Low", "Prev close", "Volume", "Avg vol
 // "-7.02 today": what the change is over, for each range.
 const string[] SPANS = { "today", "past 7 days", "past 30 days", "year to date", "past year", "past 5 years", "all time" };
 
+const int ROUND = 120;   // seconds from one refresh round to the next, see Window.beat()
+
 // A folder's settings, as the user reads them: in the order of Arrange and of Dock.
 const string[] ARRANGEMENTS = { "By value", "Horizontal strip", "Vertical strip", "Autogrid", "Fibonacci" };
 const string[] DOCKS = { "In line", "Pinned to the top", "Pinned to the bottom", "Pinned to the left", "Pinned to the right" };
@@ -36,7 +38,10 @@ public class Window : Adw.ApplicationWindow {
 
     Adw.ToastOverlay toasts = new Adw.ToastOverlay ();
     Gtk.Stack stack = new Gtk.Stack ();
-    Gtk.Label status = new Gtk.Label ("") { css_classes = { "dim-label", "caption" } };
+    Gtk.Label status = new Gtk.Label ("") { css_classes = { "dim-label", "caption", "numeric" } };
+    Gtk.Label live = new Gtk.Label ("") { css_classes = { "success", "caption", "numeric" } };   // the price stream's state, see show_status()
+    int64 next_round;   // when the next refresh round is due, on the monotonic clock
+    bool traded;        // the stream has sent a price since the card was last filled
     Gtk.Box stats = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 40) { margin_start = 18, margin_end = 18, margin_top = 4 };
     Gtk.Label value_lbl;
     Gtk.Label day_lbl;
@@ -59,6 +64,12 @@ public class Window : Adw.ApplicationWindow {
     Gtk.Label card_status = new Gtk.Label ("") { xalign = 0, css_classes = { "caption", "dim-label" } };
     Gtk.Grid facts = new Gtk.Grid () { column_spacing = 14, row_spacing = 6, margin_start = 18, margin_end = 18, margin_top = 2, margin_bottom = 12 };
     Gtk.Label[] fact_values = {};
+    // What is pinned on the chart, in words, with the way back: under the chart, over the figures.
+    Gtk.Label pin_text = new Gtk.Label ("") { xalign = 0, hexpand = true, use_markup = true, ellipsize = Pango.EllipsizeMode.END, css_classes = { "numeric" } };
+    Gtk.Box pin_row = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 12) { margin_start = 18, margin_end = 12, visible = false };
+    Past? past;            // a stock's days and earnings, fetched when a point of its chart is first pinned...
+    string past_of = "";   // ...and whose they are
+    bool past_busy;
     GenericSet<string> stats_asked = new GenericSet<string> (str_hash, str_equal);   // see fetch_stats()
     int64 stats_fetched;
     bool stats_busy;
@@ -126,8 +137,15 @@ public class Window : Adw.ApplicationWindow {
         // Range selector, shared by the chart, the Change column and the treemap.
         var ranges = new Adw.ToggleGroup () { halign = Gtk.Align.CENTER };
         foreach (unowned string label in RANGE_LABELS) ranges.add (new Adw.Toggle () { label = label });
-        ranges.notify["active"].connect (() => { range = (Range) ranges.active; update (); });
-        var bar = new Gtk.CenterBox () { center_widget = ranges, end_widget = status, margin_start = 12, margin_end = 12, margin_bottom = 8 };
+        ranges.notify["active"].connect (() => {
+            range = (Range) ranges.active;
+            chart.unpin ();
+            update ();
+        });
+        var right = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 14);
+        right.append (live);
+        right.append (status);
+        var bar = new Gtk.CenterBox () { center_widget = ranges, end_widget = right, margin_start = 12, margin_end = 12, margin_bottom = 8 };
 
         // Stocks page: headline numbers (when something is held), chart, table.
         value_lbl = stat (stats, "Value");
@@ -156,11 +174,20 @@ public class Window : Adw.ApplicationWindow {
         card.append (pricing);
         card.append (card_status);
         for (int i = 0; i < FACTS.length; i++) {
-            var value = new Gtk.Label ("—") { xalign = 0, hexpand = true, css_classes = { "numeric" } };
+            var value = new Gtk.Label ("—") { xalign = 0, hexpand = true, ellipsize = Pango.EllipsizeMode.END, css_classes = { "numeric" } };
             facts.attach (new Gtk.Label (FACTS[i]) { xalign = 0, css_classes = { "dim-label" } }, i / 3 * 2, i % 3);
             facts.attach (value, i / 3 * 2 + 1, i % 3);
             fact_values += value;
         }
+
+        var unpin = new Gtk.Button.with_label ("Back to now") { css_classes = { "flat" }, tooltip_text = "Unpin (or right-click the chart)" };
+        unpin.clicked.connect (() => {
+            chart.unpin ();
+            update ();
+        });
+        pin_row.append (pin_text);
+        pin_row.append (unpin);
+        chart.pinned.connect (() => describe.begin ());
 
         for (int i = 0; i < COLUMNS.length; i++) add_column (i);
         var bin = new Gtk.SignalListItemFactory ();
@@ -188,6 +215,7 @@ public class Window : Adw.ApplicationWindow {
         stocks.append (chart_head);
         stocks.append (card);
         stocks.append (chart);
+        stocks.append (pin_row);
         stocks.append (facts);
         stocks.append (positions);
 
@@ -226,6 +254,8 @@ public class Window : Adw.ApplicationWindow {
         pages.add_titled_with_icon (stocks, "stocks", "Stocks", "view-list-symbolic");
         pages.add_titled_with_icon (treemap, "heatmap", "Heatmap", "view-grid-symbolic");
         pages.add_titled_with_icon (new Gtk.ScrolledWindow () { child = matrix }, "performance", "Performance", "power-profile-performance-symbolic");
+        pages.notify["visible-child"].connect (() => tune ());
+        feed.heard.connect (() => { traded = true; });
 
         var empty = new Adw.StatusPage () {
             title = "No stocks yet",
@@ -246,6 +276,7 @@ public class Window : Adw.ApplicationWindow {
         var refresh = new SimpleAction ("refresh", null);
         refresh.activate.connect (() => {
             stats_fetched = 0;
+            next_round = get_monotonic_time () + ROUND * 1000000;
             sync (true, true);
             fetch_stats.begin ();
         });
@@ -328,10 +359,52 @@ public class Window : Adw.ApplicationWindow {
         update ();
         sync (true);
         feed.load_names.begin ();
-        // ponytail: a round every two minutes, which is one request per twenty Yahoo symbols whose
-        // market is open (see Feed.refresh). Yahoo publishes no limit for these endpoints; lengthen
-        // this if a large portfolio starts drawing HTTP 429.
-        Timeout.add_seconds (120, () => { sync (true); return Source.CONTINUE; });
+        next_round = get_monotonic_time () + ROUND * 1000000;
+        Timeout.add_seconds (1, () => { beat (); return Source.CONTINUE; });
+    }
+
+    // Once a second: start a refresh round when one is due, bring the card up to the stream's latest
+    // price, and count down.
+    // ponytail: a round every two minutes (ROUND), which is one request per twenty Yahoo symbols whose
+    // market is open (see Feed.refresh). Yahoo publishes no limit for these endpoints; lengthen it if
+    // a large portfolio starts drawing HTTP 429.
+    void beat () {
+        if (get_monotonic_time () >= next_round) {
+            next_round = get_monotonic_time () + ROUND * 1000000;
+            sync (true);
+        }
+        var q = shown != "" ? p.quotes[shown] : null;
+        if (traded && q != null) {
+            // ponytail: the card, its chart and its positions only. Totals, the sidebar and (for a
+            // holding in another currency) its Value and Gain wait for the next round: update() would
+            // reprice every history we hold, every second.
+            show_card (q, now_s ());
+            for (int i = 0; i < cells.length; i++) fill (cells[i]);
+        }
+        traded = false;
+        show_status ();
+    }
+
+    // The right of the range bar. Whether the open stock's price is streaming, and how often one
+    // comes; then when quotes were last fetched, and how long until they are again.
+    void show_status () {
+        int left = (int) ((next_round - get_monotonic_time ()) / 1000000).clamp (0, ROUND);
+        var next = "next in %d:%02d".printf (left / 60, left % 60);
+        status.label = updated != "" ? @"$updated · $next" : next.splice (0, 1, "N");
+        if (loading.length > 0) status.label = "Updating…";
+
+        double pace = feed.pace, quiet = feed.quiet ();
+        var streaming = "● Live · waiting for a trade";
+        if (pace.is_finite ()) streaming = pace < 1.5 ? "● Live · a price about every second" : "● Live · a price about every %.0f s".printf (pace);
+        if (quiet > double.max (60, pace * 5)) streaming = "● Live · no trades in the last %.0f min".printf (Math.floor (quiet / 60));
+        live.label = streaming;
+        live.visible = feed.live;
+    }
+
+    // Stream the price of the stock whose card is on screen; of nothing, when none is.
+    void tune () {
+        feed.follow (shown != "" && pages.visible_child_name == "stocks" ? p.quotes[shown] : null);
+        show_status ();
     }
 
     Gtk.Label stat (Gtk.Box box, string caption) {
@@ -433,7 +506,6 @@ public class Window : Adw.ApplicationWindow {
         var now = now_s ();
         p.rebase ();
         stack.visible_child_name = p.lots.get_n_items () == 0 ? "empty" : "main";
-        status.label = loading.length > 0 ? "Updating…" : updated;
 
         // With nothing held there is no portfolio to total or chart: hide the totals and chart a stock.
         bool held = false;
@@ -465,6 +537,7 @@ public class Window : Adw.ApplicationWindow {
             chart_title.label = "Portfolio";
             show_gain (chart_change, moved, moved_capital, p.currency);
             chart.plot (history, opening > 0 ? opening : double.NAN, moved >= 0, range, p.currency);
+            show_pins ();
         }
 
         columns[COL_CHANGE].title = "Chg " + RANGE_LABELS[range];
@@ -478,12 +551,14 @@ public class Window : Adw.ApplicationWindow {
         treemap.queue_draw ();
         matrix.refresh ();
         show_folders ();
+        tune ();
     }
 
     // ---- the quote card ----
 
     // Open a stock's quote card on the Stocks page, or the portfolio with "".
     void show_stock (string symbol) {
+        if (symbol != shown) chart.unpin ();
         shown = symbol;
         pages.visible_child_name = "stocks";
         update ();
@@ -515,32 +590,83 @@ public class Window : Adw.ApplicationWindow {
         int today;
         var points = q.trail (range, now, out today);
         chart.plot (points, basis, moved >= 0, range, q.currency, today);
+
+        // The figures under the chart: as they stand now or, with a point of the chart pinned, as
+        // they stood then. With a span pinned, at its start and at its end.
         var values = facts_of (q, now);
+        int64 from = chart.pin_from, to = chart.pin_to;
+        show_pins ();
+        for (int i = 0; from != 0 && i < FACTS.length; i++) values[i] = past_of == q.symbol ? "—" : "…";   // can't be had, or on its way
+        if (from != 0 && past_of == q.symbol && past != null) {
+            values = facts_of (q, now, stats_at (q, from, points.at (from), now), to != from);
+            var later = facts_of (q, now, stats_at (q, to, points.at (to), now), to != from);
+            for (int i = 0; i < FACTS.length; i++) if (later[i] != values[i]) values[i] += " → " + later[i];
+        }
         for (int i = 0; i < FACTS.length; i++) fact_values[i].label = values[i];
     }
 
-    // The figures of a quote, in FACTS' order. Where the feed has none (a Hanoi stock has no Yahoo
-    // quote) the day's range, the previous close and the year's range are worked out from the closes
-    // we hold, so those are close-to-close rather than the true highs and lows.
-    string[] facts_of (Quote q, int64 now) {
-        var s = q.stats;
+    // Under the chart, whatever it is of: what is pinned on it, and the button that unpins.
+    void show_pins () {
+        pin_row.visible = chart.pin_from != 0;
+        pin_text.label = chart.pin_text ();
+    }
+
+    // The chart's pins changed. Figures for a moment in the past need the stock's past, which is
+    // fetched the first time it is wanted (Feed.past keeps it from then on).
+    async void describe () {
+        var q = shown != "" ? p.quotes[shown] : null;
+        show_pins ();
+        if (q == null) return;   // the portfolio's chart: it has no figures to go with them
+        if (chart.pin_from != 0 && !past_busy) {
+            past_busy = true;
+            var got = yield feed.past (q);
+            past_busy = false;
+            past = got;
+            past_of = q.symbol;
+            if (got == null) fail (@"$(q.symbol): its history can't be had right now");
+        }
+        if (shown == q.symbol) show_card (q, now_s ());
+        else if (chart.pin_from != 0) describe.begin ();   // another stock was opened, and pinned, meanwhile
+    }
+
+    // A quote's figures as they stood at `t`, when it cost `price` (see Past.at). For the latest
+    // session, the day's own are the live ones: its bar was still being made when the past was fetched.
+    Stats stats_at (Quote q, int64 t, double price, int64 now) {
+        var s = past.at (t, price, q.gmtoffset);
+        if (t < q.start (Range.D1, now)) return s;
+        if (q.stats.open.is_finite ()) s.open = q.stats.open;
+        if (q.stats.high.is_finite ()) s.high = q.stats.high;
+        if (q.stats.low.is_finite ()) s.low = q.stats.low;
+        if (q.stats.volume.is_finite ()) s.volume = q.stats.volume;
+        return s;
+    }
+
+    // The figures of a quote, in FACTS' order: the feed's own, or `then`, those of a moment in its
+    // past (`brief` for when two such moments have to share a cell). Where the feed has none (a Hanoi stock has no Yahoo quote) the day's range, the previous
+    // close and the year's range are worked out from the closes we hold, so those are close-to-close
+    // rather than the true highs and lows.
+    string[] facts_of (Quote q, int64 now, Stats? then = null, bool brief = false) {
+        var s = then ?? q.stats;
         var cur = q.currency;
-        double day_low, day_high, year_low, year_high;
-        Quote.extremes (q.intra.n > 0 ? q.intra : q.daily, q.start (Range.D1, now), out day_low, out day_high);
-        Quote.extremes (q.daily, now - 365 * 86400, out year_low, out year_high);
+        double day_low = double.NAN, day_high = double.NAN, year_low = double.NAN, year_high = double.NAN, prev = s.prev_close;
+        if (then == null) {
+            Quote.extremes (q.intra.n > 0 ? q.intra : q.daily, q.start (Range.D1, now), out day_low, out day_high);
+            Quote.extremes (q.daily, now - 365 * 86400, out year_low, out year_high);
+            if (!prev.is_finite ()) prev = q.basis (Range.D1, now);
+        }
         string dividend = "—";
         if (s.dividend_yield > 0) dividend = "%.2f%%".printf (s.dividend_yield);
-        if (s.dividend_yield > 0 && s.dividend_rate > 0) dividend += " (%s a year)".printf (money (s.dividend_rate, cur));
+        if (s.dividend_yield > 0 && s.dividend_rate > 0 && !brief) dividend += " (%s a year)".printf (money (s.dividend_rate, cur));
         string volume = "—", average = "—", cap = "—", pe = "—";
         if (s.volume.is_finite ()) volume = compact (s.volume);
         if (s.avg_volume.is_finite ()) average = compact (s.avg_volume);
-        if (s.cap.is_finite ()) cap = compact (s.cap) + " " + cur;
+        if (s.cap.is_finite ()) cap = brief ? compact (s.cap) : compact (s.cap) + " " + cur;
         if (s.pe.is_finite ()) pe = "%.2f".printf (s.pe);
         return {
             money (s.open, cur),
             money (s.high.is_finite () ? s.high : day_high, cur),
             money (s.low.is_finite () ? s.low : day_low, cur),
-            money (s.prev_close.is_finite () ? s.prev_close : q.basis (Range.D1, now), cur),
+            money (prev, cur),
             volume, average, cap, pe,
             money (s.eps, cur),
             money (s.high52.is_finite () ? s.high52 : year_high, cur),
@@ -945,7 +1071,7 @@ public class Window : Adw.ApplicationWindow {
     // A background round reports an outage once, not every two minutes. `thorough`: see Feed.refresh.
     async void freshen (GenericArray<Quote> quotes, bool asked = false, bool thorough = false) {
         for (int i = 0; i < quotes.length; i++) loading.add (quotes[i].symbol);
-        status.label = "Updating…";
+        show_status ();
         var wrong = yield feed.refresh (quotes, thorough);
         if (wrong != null && (asked || !failing)) fail (wrong);
         if (wrong != null && !asked) round_failed = true;
@@ -964,7 +1090,7 @@ public class Window : Adw.ApplicationWindow {
             yield freshen (one, asked);
         } else {
             loading.add (symbol);
-            status.label = "Updating…";
+            show_status ();
             try {
                 p.quotes[symbol] = yield feed.download (symbol);
             } catch (Error e) {
@@ -984,8 +1110,11 @@ public class Window : Adw.ApplicationWindow {
             updated = new DateTime.now_local ().format (round_failed ? "Update failed %H:%M" : "Updated %H:%M");
             failing = round_failed;
             round_failed = false;
+            // Dev aids, see the Makefile.
             var shot = Environment.get_variable ("STONKS_SHOT");
-            if (shot != null) Timeout.add (1500, () => { snapshot_to (shot); return Source.REMOVE; });
+            var pin = (Environment.get_variable ("STONKS_PIN") ?? "").split (",");
+            if (pin.length > 0) Timeout.add (500, () => { chart.pin (double.parse (pin[0]), double.parse (pin[pin.length - 1])); return Source.REMOVE; });
+            if (shot != null) Timeout.add (int.parse (Environment.get_variable ("STONKS_WAIT") ?? "1500"), () => { snapshot_to (shot); return Source.REMOVE; });
         }
         update ();
     }
