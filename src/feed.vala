@@ -11,8 +11,9 @@
 //   Entrade         only Vietnam's hourly bars (see hours): SSI keeps a month of them, this broker's
 //                   chart service a year and more.
 //
-// Yahoo is also where a stock's earnings history comes from (see past), and it has the one feed that
-// isn't asked but listened to: the socket its own pages keep open for live prices (see follow).
+// Yahoo is also where a stock's earnings history comes from (see past) and its trading outside
+// regular hours (see extend), and it has the one feed that isn't asked but listened to: the socket
+// its own pages keep open for live prices (see follow).
 //
 // Search also reads Nasdaq Trader's public symbol directory, for the full names of US securities, and
 // logos come from wherever logo() says.
@@ -309,6 +310,7 @@ public class Feed : Object {
                     } else {
                         apply (q, result, now);
                         q.refreshed = now;
+                        if (q == followed) yield extend (q);
                     }
                     cache.save (q, now);
                 }
@@ -786,8 +788,35 @@ public class Feed : Object {
                 old.close (Soup.WebsocketCloseCode.NORMAL, null);
             }
             heard ();
+            if (q != null) extend.begin (q);
         }
         if (q != null) listen.begin ();
+    }
+
+    // What the followed quote has traded outside regular hours since its last regular bar, for its 1D
+    // chart to go on with (see Quote.carry): pre-market, after hours, and the night between. One small
+    // request, when its card opens and each time the quote is refreshed (every quarter of an hour, out
+    // of session); the stream fills in between. Nothing is asked for an instrument Yahoo has no such
+    // prices for (anything but US shares and funds), nor while its regular session is on.
+    async void extend (Quote q) {
+        var now = get_real_time () / 1000000;
+        var late = new Series ();
+        if (q.extended && q.intra.n > 0 && !(now >= q.opens && now < q.closes)) {
+            try {
+                int64 last = q.intra.t[q.intra.n - 1];
+                var bars = closes (yield chart (q.symbol, @"period1=$last&period2=$now&interval=5m&includePrePost=true"));
+                for (int i = 0; i < bars.n; i++) {
+                    // ponytail: "regular hours" are the last session's, on any day. A half day or a clock
+                    // change can be an hour or three out, for the quarter of an hour until the next refresh.
+                    bool regular = (bars.t[i] - q.opens) % 86400 < q.closes - q.opens;
+                    if (bars.t[i] > last && !regular) late.add (bars.t[i], bars.v[i]);
+                }
+            } catch (Error e) {
+                return;   // can't be had right now: what we have stands
+            }
+        }
+        q.late = late;
+        heard ();
     }
 
     async void listen () {
@@ -833,10 +862,14 @@ public class Feed : Object {
             if (trade.symbol != q.symbol || !(trade.price > 0)) return;
             if (trade.session == 1) {
                 q.trade (trade.price, trade.time);
-            } else if (q.stats.extra != "") {
-                // Before or after hours: the price stays the regular session's, and this is the card's other line.
-                q.stats.extra_price = trade.price;
-                q.stats.extra_change = trade.change;
+            } else {
+                // Before or after hours: the price stays the regular session's. This is the card's
+                // other line, and the grey end of its 1D chart.
+                if (q.extended) Quote.fold (q.late, trade.price, trade.time);
+                if (q.stats.extra != "") {
+                    q.stats.extra_price = trade.price;
+                    q.stats.extra_change = trade.change;
+                }
             }
             int64 at = get_monotonic_time ();
             if (heard_at > 0) pace = pace.is_finite () ? pace * 0.7 + (at - heard_at) / 1e6 * 0.3 : (at - heard_at) / 1e6;
@@ -1100,6 +1133,7 @@ public class Feed : Object {
     static void apply (Quote q, Json.Object result, int64 now) {
         var meta = result.get_object_member ("meta");
         q.intra.merge (closes (result));   // nothing new while the market is shut
+        q.extended = meta.get_boolean_member_with_default ("hasPrePostMarketData", false);
         if (meta.has_member ("currentTradingPeriod") && meta.get_object_member ("currentTradingPeriod").has_member ("regular")) {
             var session = meta.get_object_member ("currentTradingPeriod").get_object_member ("regular");
             q.opens = session.get_int_member_with_default ("start", 0);

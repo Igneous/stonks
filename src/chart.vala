@@ -55,6 +55,7 @@ public class Chart : Gtk.DrawingArea {
     bool up = true;
     Range range;
     int today;
+    int regular;
     string currency = "";
     double hover = -1;   // where the pointer is, across; negative while it is elsewhere
     // What is pinned, by time so that it stays put as the series grows: a point, or the two ends of a
@@ -96,10 +97,12 @@ public class Chart : Gtk.DrawingArea {
 
     // Show a series; `basis` (NaN for none) is drawn as the dashed reference line, `up` picks green or red.
     // `today`, if not 0, is the point the latest session starts at (see Quote.trail): an upright
-    // dashed line sets it off from the session before. What is pinned stays pinned: unpin() when the
-    // chart turns to something else.
-    public void plot (Series s, double basis, bool up, Range range, string currency, int today = 0) {
+    // dashed line sets it off from the session before. `regular`, if not 0, is how many of the points
+    // are a regular session's: the rest, traded before or after hours, are drawn in grey. What is
+    // pinned stays pinned: unpin() when the chart turns to something else.
+    public void plot (Series s, double basis, bool up, Range range, string currency, int today = 0, int regular = 0) {
         this.today = today;
+        this.regular = regular > 0 && regular < s.n ? regular : s.n;
         this.currency = currency;
         this.s = s;
         this.basis = basis;
@@ -219,10 +222,17 @@ public class Chart : Gtk.DrawingArea {
             cr.set_dash (null, 0);
         }
 
+        // Outside regular hours first, so that the session's line ends on top of it.
+        cr.set_line_width (2);
+        cr.set_line_join (Cairo.LineJoin.ROUND);
+        cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.4);
+        for (int i = regular - 1; i < s.n; i++) cr.line_to (px (i), py (s.v[i]));
+        cr.stroke ();
+
         cr.move_to (px (0), py (s.v[0]));
-        for (int i = 1; i < s.n; i++) cr.line_to (px (i), py (s.v[i]));
+        for (int i = 1; i < regular; i++) cr.line_to (px (i), py (s.v[i]));
         var line = cr.copy_path ();
-        cr.line_to (LEFT + pw, TOP + ph);
+        cr.line_to (px (regular - 1), TOP + ph);
         cr.line_to (LEFT, TOP + ph);
         cr.close_path ();
         var fade = new Cairo.Pattern.linear (0, TOP, 0, TOP + ph);
@@ -232,8 +242,6 @@ public class Chart : Gtk.DrawingArea {
         cr.fill ();
         cr.append_path (line);
         ink (cr, 1);
-        cr.set_line_width (2);
-        cr.set_line_join (Cairo.LineJoin.ROUND);
         cr.stroke ();
 
         // What is pinned: a dot on the line and a dashed level across from each point, and a wash over a span.
@@ -265,7 +273,7 @@ public class Chart : Gtk.DrawingArea {
         cr.move_to (Math.round (x) + 0.5, TOP);
         cr.line_to (Math.round (x) + 0.5, TOP + ph);
         cr.stroke ();
-        ink (cr, 1);
+        if (h < regular) ink (cr, 1);
         cr.arc (x, py (s.v[h]), 4, 0, 2 * Math.PI);
         cr.fill ();
         cr.set_source_rgba (fg.red, fg.green, fg.blue, 0.9);

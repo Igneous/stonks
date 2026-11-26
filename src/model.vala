@@ -215,6 +215,8 @@ public class Quote {
     public Series daily = new Series ();     // full history, 1d bars; the last bar is the live session
     public Series intra = new Series ();     // last 7 days, 5m bars
     public Series hourly = new Series ();    // last year, 1h bars, as of the twice-daily check; empty where the feed has none
+    public Series late = new Series ();      // 5m bars outside regular hours since the last regular one; the open card's only (see Feed.extend)
+    public bool extended;                    // the feed has prices outside regular hours for it
     public Stats stats = new Stats ();       // empty until the feed has been asked (see Feed.load_stats)
     public int64 opens;                      // the regular session the feed last reported, unix time (0 = unknown)
     public int64 closes;
@@ -326,7 +328,20 @@ public class Quote {
     // refresh replaces these bars with the feed's own.
     public void trade (double p, int64 t) {
         tick (p, t);
-        if (intra.n > 0 && t - intra.t[intra.n - 1] < 300) intra.set_last (p); else intra.add (t - t % 300, p);
+        fold (intra, p, t);
+    }
+
+    // A price into the 5-minute bar it falls in: the newest one, or a new one.
+    public static void fold (Series bars, double p, int64 t) {
+        if (bars.n > 0 && t - bars.t[bars.n - 1] < 300) bars.set_last (p); else bars.add (t - t % 300, p);
+    }
+
+    // Carry a 1D view on past its session with what has traded since, outside regular hours. Returns
+    // how many of its points are the session's own: the chart draws the rest apart.
+    public int carry (Series view) {
+        int regular = view.n;
+        for (int i = regular > 0 ? late.before (view.t[regular - 1] + 1) + 1 : late.n; i < late.n; i++) view.add (late.t[i], late.v[i]);
+        return regular;
     }
 
     // FX rate at a moment: the finest bars that reach back to it, else that day's close.

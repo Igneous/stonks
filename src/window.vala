@@ -589,7 +589,8 @@ public class Window : Adw.ApplicationWindow {
         card_status.visible = when.length > 0;
         int today;
         var points = q.trail (range, now, out today);
-        chart.plot (points, basis, moved >= 0, range, q.currency, today);
+        int regular = range == Range.D1 ? q.carry (points) : 0;   // then on into what has traded since, out of hours
+        chart.plot (points, basis, moved >= 0, range, q.currency, today, regular);
 
         // The figures under the chart: as they stand now or, with a point of the chart pinned, as
         // they stood then. With a span pinned, at its start and at its end.

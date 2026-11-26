@@ -90,6 +90,14 @@ void main () {
     assert (a.intra.n == 1 && a.intra.t[0] == NOW - NOW % 300 && a.daily.n == 10);
     a.trade (112, NOW + 400);
     assert (a.intra.n == 2);
+    // Out of hours: bars of their own, which carry a 1D view on from wherever its session ended.
+    var session = a.trail (Range.D1, NOW + 400, out today);
+    Quote.fold (a.late, 99, a.intra.t[1]);         // no later than the session's last bar: not carried
+    Quote.fold (a.late, 113, a.intra.t[1] + 300);
+    Quote.fold (a.late, 114, a.intra.t[1] + 400);
+    assert (a.late.n == 2 && session.n == 2 && a.carry (session) == 2 && session.n == 3);
+    near (session.v[session.n - 1], 114);
+    near (a.price, 112);
     near (a.intra.v[0], 111);
     near (a.daily.v[9], 112);
     a = quote ("A", "USD", 100, 1);
