@@ -85,7 +85,7 @@ public class Feed : Object {
     const string STREAM = "wss://streamer.finance.yahoo.com/?version=2";
     const int BATCH = 20;   // the most symbols Yahoo's spark endpoint takes in one request
     const string[] REACHES = { "1d", "7d", "1mo", "3mo", "1y" };   // how far back a spark request can ask
-    const string VERSION = "1.1";   // `make check` holds the metainfo's newest release to this
+    const string VERSION = "1.2";   // `make check` holds the metainfo's newest release to this
     Soup.Session session = new Soup.Session () { timeout = 30 };   // no user_agent here: it would override agent()'s
     HashTable<string, string>? names;   // US symbol -> full security name, once load_names() has run
     string? crumb;                      // see quote_batch()
